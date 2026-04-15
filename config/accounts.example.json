@@ -1,0 +1,44 @@
+{
+  "email": {
+    "accounts": [
+      {
+        "id": "personal",
+        "label": "Personal",
+        "type": "gmail"
+      },
+      {
+        "id": "work",
+        "label": "Work",
+        "type": "gmail"
+      },
+      {
+        "id": "business_name",
+        "label": "Business Name",
+        "google_account": "business",
+        "type": "gmail"
+      },
+      {
+        "id": "yahoo",
+        "label": "Yahoo",
+        "type": "yahoo"
+      }
+    ]
+  },
+  "calendar": {
+    "account_labels": {
+      "default": "Personal"
+    },
+    "calendar_id_labels": {
+      "example@workspace.com": "Work Label"
+    },
+    "excluded_calendar_ids_by_account": {
+      "default": [
+        "holidays@example.com"
+      ]
+    }
+  },
+  "locations": {
+    "home": "Your home address",
+    "work": "Your work address"
+  }
+}

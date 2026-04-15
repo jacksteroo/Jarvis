@@ -1,0 +1,19 @@
+.env
+__pycache__/
+.venv/
+node_modules/
+*.pyc
+*.pyo
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store
+*.sqlite
+*.log
+logs/*
+docs/LIFE_CONTEXT.md
+
+# Local config — personal data, never commit
+config/local/*
+!config/local/.gitkeep

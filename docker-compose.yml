@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: pepper-postgres
+    environment:
+      POSTGRES_USER: pepper
+      POSTGRES_PASSWORD: pepper
+      POSTGRES_DB: pepper
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pepper"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pepper:
+    build: .
+    image: pepper:latest
+    container_name: pepper-agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override localhost refs to use Docker service names
+      POSTGRES_URL: postgresql+asyncpg://pepper:pepper@postgres:5432/pepper
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      RUNNING_IN_DOCKER: "1"
+      PYTHONPATH: /app
+    ports:
+      - "8000:8000"
+    volumes:
+      # Google OAuth tokens + credentials
+      - ${HOME}/.config/pepper:/root/.config/pepper:rw
+      # HuggingFace model cache (sentence-transformers)
+      - huggingface_cache:/root/.cache/huggingface
+      # Persist mirrored application logs on the host
+      - ./logs:/app/logs
+      # Live-reload source during development
+      - ./agent:/app/agent
+      - ./subsystems:/app/subsystems
+      - ./docs:/app/docs
+      # iMessage — requires Docker Desktop to have Full Disk Access
+      # (System Settings → Privacy & Security → Full Disk Access → Docker Desktop)
+      - ${HOME}/Library/Messages:/data/messages:ro
+      # WhatsApp Desktop — locked while WhatsApp is running; quit WhatsApp first
+      - "${HOME}/Library/Group Containers/group.net.whatsapp.WhatsApp.shared:/data/whatsapp:ro"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  web:
+    image: node:20-alpine
+    container_name: pepper-web
+    restart: unless-stopped
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_URL: http://pepper:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./web:/app
+    depends_on:
+      - pepper
+
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: pepper-tunnel
+  #   restart: unless-stopped
+  #   command: tunnel run pepper
+  #   volumes:
+  #     - ~/.cloudflared:/home/nonroot/.cloudflared:ro
+  #   depends_on:
+  #     - pepper
+
+volumes:
+  postgres_data:
+  huggingface_cache:
