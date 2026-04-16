@@ -1,0 +1,19 @@
+# Pepper MCP Server — Tool Access Control
+#
+# Which of Pepper's tools are exposed to external MCP clients
+# (Claude Desktop, Claude Code, Cursor, etc.).
+#
+# Tools in the NEVER_EXPOSE list (raw personal data tools like
+# iMessage, WhatsApp, email body readers, Slack message readers)
+# are always blocked regardless of this config.
+
+allowed_tools:
+  - get_upcoming_events
+  - get_calendar_events_range
+  - list_calendars
+  - search_web
+  # Uncomment to expose more tools (all are non-personal):
+  # - get_email_unread_counts
+  # - get_contact_profile
+  # - find_quiet_contacts
+  # - get_comms_health_summary

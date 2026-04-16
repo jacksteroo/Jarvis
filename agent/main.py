@@ -55,6 +55,8 @@ async def lifespan(app: FastAPI):
     logger.info("pepper_started")
     yield
     logger.info("pepper_stopping")
+    if pepper:
+        await pepper.shutdown()
     if scheduler:
         scheduler.stop()
 
@@ -252,6 +254,46 @@ async def act_on_improvement(improvement_id: str, req: ImprovementAction):
     if not ok:
         raise HTTPException(status_code=404, detail="Improvement not found or already actioned")
     return {"ok": True, "id": improvement_id, "action": req.action}
+
+
+@app.get("/mcp/servers", dependencies=[Depends(require_api_key)])
+async def get_mcp_servers():
+    """List connected MCP servers and their status."""
+    p = _get_pepper()
+    if not p or not p._mcp_client:
+        return {"servers": [], "count": 0}
+    health = await p._mcp_client.check_health()
+    servers = []
+    for name, conn in p._mcp_client.servers.items():
+        servers.append({
+            "name": name,
+            "trust_level": conn.config.trust_level,
+            "status": conn.status,
+            "tool_count": len(conn.tools),
+            "tools": [t.name for t in conn.tools],
+        })
+    return {"servers": servers, "count": len(servers)}
+
+
+@app.get("/mcp/tools", dependencies=[Depends(require_api_key)])
+async def get_mcp_tools():
+    """List all tools available from MCP servers."""
+    p = _get_pepper()
+    if not p:
+        return {"tools": [], "count": 0}
+    mcp_tools = p.tool_router.get_mcp_tools()
+    return {
+        "tools": [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "server": t.get("_mcp_server", ""),
+                "trust_level": t.get("_trust_level", ""),
+            }
+            for t in mcp_tools
+        ],
+        "count": len(mcp_tools),
+    }
 
 
 @app.get("/comms-health", dependencies=[Depends(require_api_key)])
