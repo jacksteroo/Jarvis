@@ -6,7 +6,7 @@ heavy=True so the skill system guides the response — no hand-rolled formatters
 """
 
 import structlog
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -113,11 +113,28 @@ class PepperScheduler:
         # If memory is unavailable (no DB/embeddings), fall through and notify anyway
         # rather than silently drop a potential reminder.
         raw = await self.pepper.memory.search_recall("COMMITMENT", limit=20)
-        open_items = [
-            item for item in raw
-            if item.get("content", "").upper().startswith("COMMITMENT:")
-            and not item.get("content", "").upper().startswith("COMMITMENT: [RESOLVED]")
-        ]
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+        open_items = []
+        for item in raw:
+            content = item.get("content", "").upper()
+            if not content.startswith("COMMITMENT:"):
+                continue
+            if content.startswith("COMMITMENT: [RESOLVED]"):
+                continue
+            # Skip commitments recorded in the last 48 hours — they don't need a
+            # reminder yet. Items with no parseable timestamp are included so we
+            # never silently drop a reminder.
+            created_raw = item.get("created_at")
+            if created_raw:
+                try:
+                    created = datetime.fromisoformat(created_raw)
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    if created > cutoff:
+                        continue
+                except ValueError:
+                    pass
+            open_items.append(item)
 
         if not open_items:
             logger.info("commitment_check_no_open_items")

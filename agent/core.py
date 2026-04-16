@@ -723,8 +723,12 @@ class PepperCore:
             # upgrades are blocked whenever any of those contexts is non-empty.
             # Frontier models must never receive raw personal content.
             if heavy and any(s.model == "frontier" for s in matched_skills):
+                # memory_context is included here because build_context_for_query()
+                # injects raw recalled contents verbatim — it must never reach a
+                # frontier model even when the message-channel contexts are empty.
                 has_raw_personal = any([
-                    email_context, imessage_context, whatsapp_context, slack_context
+                    memory_context, email_context, imessage_context,
+                    whatsapp_context, slack_context,
                 ])
                 if has_raw_personal:
                     chat_logger.warning(
