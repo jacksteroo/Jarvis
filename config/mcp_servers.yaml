@@ -1,0 +1,32 @@
+# Pepper MCP Server Configuration
+# Each server must declare a trust_level:
+#   local    — runs on this machine, inside Pepper's trust boundary
+#   trusted  — self-hosted, user-operated, non-public
+#   external — any third-party MCP service
+#
+# Privacy routing rules (enforced by tool_router.py):
+#   local:    can receive raw personal data
+#   trusted:  can receive sanitized/structured data (no message bodies)
+#   external: summaries only (same rules as Claude API)
+
+servers: []
+  # Example configurations:
+  #
+  # - name: github
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-github"]
+  #   env:
+  #     GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
+  #   trust_level: external
+  #
+  # - name: filesystem
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+  #   trust_level: local
+  #
+  # - name: notion
+  #   command: npx
+  #   args: ["-y", "@notionhq/notion-mcp-server"]
+  #   env:
+  #     OPENAPI_MCP_HEADERS: '{"Authorization": "Bearer ${NOTION_TOKEN}", "Notion-Version": "2022-06-28"}'
+  #   trust_level: trusted

@@ -11,6 +11,7 @@ from agent.config import Settings
 from agent.llm import ModelClient
 from agent.life_context import build_system_prompt, get_owner_name, update_life_context
 from agent.tool_router import ToolRouter
+from agent.mcp_client import MCPClient
 from agent.memory import MemoryManager
 from agent.memory_tools import MEMORY_TOOLS
 from agent.models import Conversation
@@ -100,7 +101,8 @@ IMAGE_TOOLS = [
 
 
 class PepperCore:
-    def __init__(self, config: Settings, db_session_factory=None, skills_dir=None):
+    def __init__(self, config: Settings, db_session_factory=None, skills_dir=None,
+                 mcp_config_path=None):
         self.config = config
         self.db_factory = db_session_factory
         self.llm = ModelClient(config)
@@ -108,6 +110,7 @@ class PepperCore:
             llm_client=self.llm, db_session_factory=db_session_factory
         )
         self.tool_router = ToolRouter()
+        self._mcp_client = MCPClient(config_path=mcp_config_path)
         self._system_prompt: str = ""
         self._initialized = False
         self.commitment_extractor = CommitmentExtractor(llm_client=self.llm)
@@ -292,6 +295,16 @@ class PepperCore:
     async def initialize(self) -> None:
         """Call once at startup."""
         self._system_prompt = build_system_prompt(self.config.LIFE_CONTEXT_PATH, self.config)
+
+        # Phase 5: initialize MCP client and wire it into the tool router
+        try:
+            await self._mcp_client.initialize()
+            self.tool_router.set_mcp_client(self._mcp_client)
+            mcp_tool_count = len(self._mcp_client.get_tools())
+            logger.info("mcp_client_ready", tool_count=mcp_tool_count)
+        except Exception as e:
+            logger.warning("mcp_init_failed", error=str(e))
+
         self._initialized = True
         logger.info("pepper_initialized", subsystems=self._probe_subsystem_health())
 
@@ -705,7 +718,11 @@ class PepperCore:
                 "6. If the user names a specific source like WhatsApp, answer "
                 "from that source only unless they explicitly ask to combine "
                 "multiple sources.\n"
-                f"7. Be concise and direct. {owner_first} prefers short answers."
+                f"7. Be concise and direct. {owner_first} prefers short answers.\n"
+                "8. ONLY address the CURRENT user message — the last message in the "
+                "conversation. Prior turns are history for context only. Do NOT "
+                "re-answer, continue, or follow up on topics from earlier turns "
+                "unless the current message explicitly asks you to."
             )
             await _progress("Synthesizing response...")
 
@@ -767,8 +784,12 @@ class PepperCore:
             messages = await self._compressor.compress(messages)
             chat_logger.info("context_compression_complete", n_messages=len(messages))
 
-        # All tools run in-process — no HTTP microservices to fetch from.
+        # Native tools run in-process; MCP tools route via the tool router.
         tools = MEMORY_TOOLS + CALENDAR_TOOLS + EMAIL_TOOLS + IMESSAGE_TOOLS + WHATSAPP_TOOLS + SLACK_TOOLS + CONTACT_TOOLS + COMMS_HEALTH_TOOLS + IMAGE_TOOLS
+        # Phase 5: append MCP tools discovered from external servers
+        mcp_tools = self.tool_router.get_mcp_tools()
+        if mcp_tools:
+            tools = tools + mcp_tools
 
         # Call LLM — catches ClassifiedLLMError from Phase 3.3 error classifier.
         # Context overflow mid-call (edge case: compressor threshold was not hit but
@@ -1051,11 +1072,23 @@ class PepperCore:
         return response_text
 
     async def _execute_tool(self, name: str, args: dict) -> dict:
-        """Route tool call to memory tools or subsystem."""
+        """Route tool call to memory tools, subsystem, or MCP server."""
         started_at = time.perf_counter()
         logger.info("tool_call_started", name=name, args=args)
 
         try:
+            # Phase 5: MCP tool routing (mcp_{server}_{tool} namespace)
+            if self.tool_router.is_mcp_tool(name):
+                result = await self.tool_router.call_mcp_tool(name, args)
+                logger.info(
+                    "tool_call_completed",
+                    name=name,
+                    duration_ms=round((time.perf_counter() - started_at) * 1000),
+                    result=self._summarize_tool_result(result),
+                    source="mcp",
+                )
+                return result
+
             if name == "save_memory":
                 await self.memory.save_to_recall(
                     args.get("content", ""), args.get("importance", 0.5)
@@ -1346,4 +1379,15 @@ class PepperCore:
         }
         if hasattr(self, '_scheduler') and self._scheduler:
             status["scheduler"] = self._scheduler.get_status()
+        # Phase 5: MCP server status
+        if self._mcp_client and self._mcp_client.servers:
+            mcp_health = await self._mcp_client.check_health()
+            status["mcp_servers"] = mcp_health
+            status["mcp_tool_count"] = len(self._mcp_client.get_tools())
         return status
+
+    async def shutdown(self) -> None:
+        """Graceful shutdown — close MCP connections."""
+        if self._mcp_client:
+            await self._mcp_client.shutdown()
+            logger.info("mcp_client_shutdown")

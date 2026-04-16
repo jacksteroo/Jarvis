@@ -22,11 +22,19 @@ _FALLBACK_ACKS = [
 ]
 
 _ACK_SYSTEM_PROMPT = (
-    "You are Pepper, a sharp AI chief of staff. "
+    "You are Pepper, a sharp AI chief of staff. You are a single AI — never say 'we', 'our', "
+    "'my team', or imply you are a group. Always use first-person singular (I, me, my). "
     "Write a brief conversational acknowledgment (2 sentences max) of what the user is asking. "
     "First sentence: rephrase what they want in plain language so they know you understood. "
     "Second sentence: say you're working on it — natural, not robotic. "
     "No emojis. No bullet points. No 'certainly' or 'of course'. Keep it under 30 words total."
+)
+
+# Messages that are pure social acknowledgments — no data fetch needed.
+_PURE_ACK_RE = re.compile(
+    r"^\s*(great[,!.]*\s*)?(thanks|thank you|thx|ty|ok|okay|cool|got it|"
+    r"sounds good|perfect|nice|awesome|cheers|noted|will do|👍|🙏)\s*[!.]*\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -193,7 +201,10 @@ class JARViSTelegramBot:
         session_id = str(update.effective_user.id)
         logger.info("telegram_in", user_id=session_id, text=user_message[:300])
 
-        if self.config.ALWAYS_HEAVY:
+        # Pure social acks never need calendar/inbox/web fetches.
+        if _PURE_ACK_RE.match(user_message):
+            heavy = False
+        elif self.config.ALWAYS_HEAVY:
             heavy = True
         else:
             heavy = await self.pepper.classify_query(user_message)

@@ -213,10 +213,24 @@ This contract means any subsystem can be replaced without modifying Pepper Core.
 - **Context compression** (`agent/context_compressor.py`) — auto-compresses long conversations before hitting the model's context window; always runs on local Ollama (privacy invariant enforced)
 - **Error classifier + smart fallback** (`agent/error_classifier.py`) — typed `ErrorCategory` / `DataSensitivity` error handling; classified retry loop; privacy invariant preserved under all failure modes
 
+### SKILL SYSTEM (Phase 4) — ✅ Complete
+
+- **Skill files** (`skills/*.md`) — YAML frontmatter + workflow markdown
+- **Skill injection** (`agent/skills.py`) — trigger matching + prompt injection
+- **Self-improving** (`agent/skill_reviewer.py`) — background review + human-approved diffs
+- 5 working skills: morning_brief, weekly_review, commitment_check, draft_reply_to_contact, prep_for_meeting
+
+### MCP INTEGRATION (Phase 5) — ✅ Complete
+
+- **MCP Client** (`agent/mcp_client.py`) — connects to external MCP servers via stdio, discovers tools, routes calls
+- **MCP Audit** (`agent/mcp_audit.py`) — privacy-preserving trust levels (local/trusted/external), data classification, audit logging
+- **Subsystem MCP servers** (`subsystems/calendar/mcp_server.py`, `subsystems/communications/mcp_server.py`) — subsystems exposed as standalone MCP services
+- **Pepper as MCP Server** (`agent/mcp_server.py`) — exposes safe subset of tools to Claude Desktop/Code/Cursor
+- **Privacy enforcement**: `RAW_PERSONAL_TOOLS` (iMessage, WhatsApp, email, Slack, memory) NEVER reach external/trusted servers; 59 regression tests
+- Configuration: `config/mcp_servers.yaml` (external servers), `config/mcp_server_access.yaml` (access control)
+
 ### Not Yet Started
 
-- **SKILL SYSTEM** (Phase 4) — SKILL.md structured workflows, skill injection, self-improving via user-approved diffs
-- **MCP INTEGRATION** (Phase 5) — subsystems as standalone MCP servers; external MCP servers (GitHub, Linear, Obsidian) as first-class tools
 - **PEOPLE** — Corela integration (future, post Phase 5)
 - **KNOWLEDGE** (post Phase 5) — Notes, documents, decision log
 - **HEALTH** (post Phase 5) — Apple Health export parsing

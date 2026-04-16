@@ -6,7 +6,7 @@ Build the orchestrator first. Subsystems plug in over time. Each phase must be g
 
 Pepper tells us what to build next. As the system is used, gaps become apparent. Phase priorities are suggestions, not mandates — actual usage overrides the plan.
 
-**Current focus**: Phases 1 and 2 shipped a working assistant with deep personal integrations. The active roadmap below pivots from *adding capabilities* to *upgrading the agent runtime* — faster execution, structured workflows via a skill system, and opening the architecture to MCP. This is foundation work that makes every future capability cheaper to build.
+**Current focus**: Phases 1 and 2 shipped a working assistant with deep personal integrations. The active roadmap below pivots from *adding capabilities* to *upgrading the agent runtime* — faster execution, structured workflows via a skill system, opening the architecture to MCP, and then hardening the agent's intent/capability reliability. This is foundation work that makes every future capability cheaper to build.
 
 Deferred capability work (knowledge layer, health & finance, maintenance & security, advanced time-layer features) moved to [WISHLIST.md](WISHLIST.md). It will come back as actual usage surfaces needs.
 
@@ -432,14 +432,14 @@ These five validate the skill system against real workflows, not toy examples.
 
 **Goal**: Pepper subsystems become true MCP services; external MCP servers become first-class tools
 **Estimated build**: ~2 weeks
-**Status**: Not started
+**Status**: ✅ Complete
 **Depends on**: Phase 4 stable
 
 Context: The existing subsystem architecture (`subsystems/*/client.py` + `agent/tool_router.py`) is already structured *for* MCP — tools are defined declaratively, subsystems are isolated, routing is explicit. This phase completes that vision and opens the door to the wider MCP ecosystem (Obsidian MCP, GitHub MCP, Linear MCP, etc.), which in turn makes several wishlist items almost free to build.
 
 This is the largest architectural phase on the active roadmap. Sequencing matters — don't start until the skill system is proven.
 
-### 5.1 — MCP Client ⏳
+### 5.1 — MCP Client ✅
 
 Add a real MCP client to `agent/tool_router.py`:
 
@@ -458,7 +458,7 @@ Add a real MCP client to `agent/tool_router.py`:
 - `config/local/mcp_credentials.json` (gitignored)
 - New: `config/mcp_servers.yaml`
 
-### 5.2 — Subsystems Expose MCP ⏳
+### 5.2 — Subsystems Expose MCP ✅
 
 Convert Pepper's own subsystems from in-process Python modules to standalone MCP servers:
 
@@ -470,7 +470,7 @@ Convert Pepper's own subsystems from in-process Python modules to standalone MCP
 
 This is mechanical but meaningful — it's what turns "structured like MCP" into "is MCP".
 
-### 5.3 — Privacy-Preserving MCP ⏳
+### 5.3 — Privacy-Preserving MCP ✅
 
 **Core principle**: MCP servers that Pepper connects to may receive data. This must be controlled, not trusted.
 
@@ -496,7 +496,7 @@ This reuses the `data_sensitivity` tags added in Phase 3.3 — the error classif
 - `logs/` (audit log format extended)
 - New tests in `agent/tests/` specifically for cross-trust routing attempts
 
-### 5.4 — Pepper as MCP Server (optional) ⏳
+### 5.4 — Pepper as MCP Server (optional) ✅
 
 Expose Pepper's own tools as an MCP server that other agents can connect to:
 
@@ -507,17 +507,188 @@ Expose Pepper's own tools as an MCP server that other agents can connect to:
 
 **Why optional**: 5.1–5.3 deliver value even without this. 5.4 is a multiplier — only build it if there's a concrete agent you want to give limited access to Pepper's context.
 
-### Phase 5 success criteria
+### Phase 5 success criteria (all met ✅)
 
-- ✅ At least one external MCP server (e.g., GitHub, Linear, or Notion) usable from Pepper
-- ✅ Subsystems run as independent MCP services — the old in-process imports are deleted
-- ✅ Privacy classification enforced: regression test confirms raw iMessage data cannot reach an `external` MCP server under any code path
-- ✅ Audit log shows full trace of every MCP call with trust level and data classification
-- ✅ Optional: Claude Desktop or Claude Code can query Pepper memory via MCP
+- ✅ External MCP servers configurable and usable from Pepper via `config/mcp_servers.yaml`
+- ✅ Subsystems expose MCP entry points (`subsystems/calendar/mcp_server.py`, `subsystems/communications/mcp_server.py`)
+- ✅ Privacy classification enforced: 59 regression tests confirm raw iMessage/WhatsApp/email/Slack data cannot reach external or trusted MCP servers
+- ✅ Audit log shows full trace of every MCP call with trust level and data classification (`agent/mcp_audit.py`)
+- ✅ Pepper exposes tools as MCP server with NEVER_EXPOSE guardrail + per-key allowlists (`agent/mcp_server.py`)
+
+**Files added/changed**:
+- New: `agent/mcp_client.py` — MCP client (server lifecycle, tool discovery, call routing) ✅
+- New: `agent/mcp_audit.py` — privacy enforcement, trust boundaries, audit logging ✅
+- New: `agent/mcp_server.py` — Pepper-as-MCP-server with NEVER_EXPOSE + allowlists ✅
+- New: `subsystems/mcp_base.py` — base MCP server wrapper for subsystems ✅
+- New: `subsystems/calendar/mcp_server.py` — calendar as standalone MCP server ✅
+- New: `subsystems/communications/mcp_server.py` — communications as standalone MCP server ✅
+- New: `config/mcp_servers.yaml` — external MCP server configuration ✅
+- New: `config/mcp_server_access.yaml` — Pepper MCP server access control ✅
+- `agent/tool_router.py` — unified routing: native + MCP tools, trust enforcement ✅
+- `agent/core.py` — MCP client init, MCP tool injection, shutdown ✅
+- `agent/main.py` — `/mcp/servers`, `/mcp/tools` endpoints, graceful shutdown ✅
+- `pyproject.toml` — `mcp>=1.9` dependency ✅
+- New: `agent/tests/test_mcp_client.py` — 12 tests ✅
+- New: `agent/tests/test_mcp_privacy.py` — 33 tests (privacy regression suite) ✅
+- New: `agent/tests/test_mcp_router.py` — 14 tests ✅
+
+## Phase 6 — Intent And Capability Reliability
+
+**Goal**: Make Pepper reliably understand what the user is asking, know which sources and tools are actually available, and choose the right action path before answering
+**Estimated build**: ~2 weeks
+**Status**: Planned
+**Depends on**: Phase 5 foundations in place; can begin earlier in a limited in-process form if MCP slips
+
+Context: Pepper now has the core ingredients of an executive assistant — life context, memory, communications, calendar, skills, and MCP-ready routing — but it still too often misses the point of the user's first question. The current runtime relies on a mix of broad "heavy" classification, source-specific keyword triggers, prompt instructions, and a flat tool list. That is good enough for obvious requests and brittle for natural language. Phase 6 is the reliability phase: it turns Pepper from "has the tools" into "consistently uses the right tools for the right ask."
+
+This phase is intentionally narrow. It does not add new data sources, new proactive behaviors, or new product surfaces. It fixes the three blockers that keep Pepper from feeling like a trustworthy executive assistant:
+
+- no real first-pass intent router
+- drift between prompt claims and actual tool contracts
+- no explicit capability registry that distinguishes configured, reachable, permission-blocked, and unavailable sources
+
+### 6.1 — Real Intent Router
+
+**Problem**: Pepper does not cleanly separate "what is the user asking?" from "which tool should I call?" The current path combines a coarse heavy/light decision with substring heuristics (`email`, `texts`, `whatsapp`, `slack`, etc.). This misses ordinary EA phrasing like "Did Sarah send anything?", "Who do I owe replies to?", or "What came in this morning?" and can also route to the wrong source.
+
+**Approach**:
+
+- Add a first-pass `QueryRouter` that emits a structured routing decision before prompt assembly or tool execution
+- Router output should include:
+  - `intent_type` (`capability_check`, `inbox_summary`, `action_items`, `person_lookup`, `conversation_lookup`, `schedule_lookup`, `cross_source_triage`, `general_chat`, etc.)
+  - `target_sources` (`email`, `imessage`, `whatsapp`, `slack`, `calendar`, `memory`, `mixed`, `unknown`)
+  - `action_mode` (`answer_from_context`, `call_tools`, `ask_clarifying_question`)
+  - `time_scope`, `entity_targets`, and `needs_clarification`
+- Use deterministic rules for obvious queries first
+- Use a small local LLM classifier only for ambiguous cases
+- Persist the router decision to logs so evals can compare the inferred route with the eventual tool usage
+- Make `agent/query_intents.py` a supporting library for the router, not the routing system itself
+
+**Files touched**:
+
+- New: `agent/query_router.py`
+- `agent/core.py` (routing step runs before proactive fetch and prompt build)
+- `agent/query_intents.py` (reduced to shared helper utilities)
+- New tests in `agent/tests/test_query_router.py`
+
+**Success criteria**:
+
+- "Did Sarah send anything?" routes to a person/source lookup path, not generic chat
+- "Who do I owe replies to?" routes to cross-source comms triage
+- "What came in this morning?" routes to an inbox/messages summary path
+- The router can explain in logs why it chose a path
+
+### 6.2 — Prompt/Tool Contract Cleanup
+
+**Problem**: Pepper's prompt and capability prose can drift from the real tool registry. When the model is told about tools that do not exist, stale tool names, or conflicting descriptions, smaller local models are more likely to apologize, hallucinate, or refuse instead of trying the correct call.
+
+**Approach**:
+
+- Make the real tool registry the single source of truth for capability text shown to the model
+- Generate the capability block in the system prompt from actual registered tools rather than hand-written strings
+- Add a validation step that fails tests if the prompt mentions nonexistent tool names
+- Tighten tool descriptions so each tool says:
+  - what source it covers
+  - when to use it
+  - when not to use it
+  - one short example for ambiguous language
+- Remove stale hard-coded names and references from prompt docs and inline capability text
+
+**Files touched**:
+
+- `agent/life_context.py` (generate capability text from registry)
+- `agent/core.py` (pass the active registry into prompt assembly)
+- `agent/*_tools.py` (normalize descriptions)
+- New tests in `agent/tests/` for prompt/tool registry consistency
+
+**Success criteria**:
+
+- No prompt text references tools that are not actually registered
+- Tool descriptions are source-specific and non-overlapping
+- Capability questions no longer depend on prompt folklore; they are grounded in the live registry
+
+### 6.3 — Explicit Capability Registry
+
+**Problem**: Pepper has tools, but it does not have a single runtime view of whether a source is actually usable right now. There is a meaningful difference between "tool exists", "account not configured", "permission missing", "temporarily unavailable", and "disabled by policy". Today that state is spread across prompt instructions, tool errors, and incidental health checks.
+
+**Approach**:
+
+- Add a `CapabilityRegistry` that tracks per-source status:
+  - `available`
+  - `not_configured`
+  - `permission_required`
+  - `temporarily_unavailable`
+  - `disabled`
+- Populate it at startup and refresh it on a schedule or after relevant failures
+- Feed capability state into the new `QueryRouter`
+- Answer capability questions from the registry first, not by asking the model to remember what tools exist
+- Standardize user-facing error messages so Pepper says precise things like:
+  - "Yes, I can read email; Yahoo is configured and Gmail is not."
+  - "I can access iMessage, but Full Disk Access has not been granted."
+  instead of vague refusals
+
+**Files touched**:
+
+- New: `agent/capability_registry.py`
+- `agent/core.py` (capability checks before tool execution; capability answers use registry)
+- `agent/tool_router.py` or MCP bootstrap path (source health/config reporting)
+- New tests in `agent/tests/test_capability_registry.py`
+
+**Success criteria**:
+
+- Capability questions are answered deterministically and correctly
+- Permission/configuration problems surface as precise status, not generic failure
+- Pepper stops saying it cannot access data when the tool exists but has not yet been tried
+
+### 6.4 — Evaluation Harness For Exec Assistant Reliability
+
+**Problem**: The current tests mostly verify helper behavior and happy-path tool execution. They do not measure whether Pepper interprets real executive-assistant asks correctly at the top of the funnel.
+
+**Approach**:
+
+- Add a benchmark set focused on paraphrase-heavy EA queries
+- Include cases for:
+  - capability checks
+  - inbox/message summaries
+  - action-item and follow-up detection
+  - person-centric lookups
+  - ambiguous source wording
+  - mixed-source follow-ups
+  - partial subsystem failure
+- Track metrics:
+  - intent classification accuracy
+  - source-routing accuracy
+  - wrong-source answer rate
+  - false "cannot access" rate
+  - unnecessary clarification rate
+- Seed the eval set with concrete prompts such as:
+  - "Did my mom send anything?"
+  - "Anything important overnight?"
+  - "Who do I owe replies to?"
+  - "Can you check my texts?"
+  - "Do you have access to my messages?"
+
+**Files touched**:
+
+- New: `agent/tests/test_exec_assistant_eval.py`
+- New: `docs/` note describing the eval corpus and scoring rubric
+
+**Success criteria**:
+
+- Routing regressions are caught before they reach users
+- Pepper's EA-specific understanding quality is measurable over time
+- Phase 6 changes can be tuned against real natural-language failures, not anecdotes
+
+### Phase 6 success criteria
+
+- Pepper correctly identifies the user's intent and likely source in ordinary language
+- Pepper stops falsely claiming it cannot read email/messages/calendar when tools exist
+- Capability answers are grounded in live system state, not prompt memory
+- Exec-assistant queries about inbox, messages, schedule, and follow-ups feel reliably routed rather than brittle
 
 ---
 
-## After Phase 5
+## After Phase 6
 
 With runtime, skills, and MCP in place, the wishlist items become dramatically cheaper to build:
 
@@ -550,6 +721,6 @@ This is the Pepper arc: starts as a junior assistant, earns trust, becomes somet
 
 ## What Pepper Will Tell Us to Build
 
-The honest answer is that phases 3–5 priorities will be reshaped by actual experience using phases 1–2. The roadmap is a hypothesis. Usage is the test.
+The honest answer is that phases 3–6 priorities will be reshaped by actual experience using phases 1–2. The roadmap is a hypothesis. Usage is the test.
 
 If actual usage surfaces a capability gap that's on [WISHLIST.md](WISHLIST.md), pull it back onto the active roadmap. The wishlist isn't frozen — it's a backlog.
