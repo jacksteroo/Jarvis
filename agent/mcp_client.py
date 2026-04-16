@@ -30,6 +30,53 @@ import yaml
 logger = structlog.get_logger()
 
 
+# ── MCP result extraction helpers ────────────────────────────────────────────
+
+def _extract_text_content(content_blocks: list) -> str:
+    """Extract only text from MCP content blocks (for error messages)."""
+    return "\n".join(
+        part.text for part in content_blocks if hasattr(part, "text")
+    )
+
+
+def _extract_content(content_blocks: list) -> Any:
+    """Extract the most useful representation from MCP content blocks.
+
+    Returns a string when all blocks are text (the common case).
+    Returns a list of typed dicts when blocks are mixed (images, resources).
+    This preserves information that would otherwise be silently discarded
+    when a server returns structured or binary content alongside text.
+    """
+    if not content_blocks:
+        return ""
+
+    parts = []
+    for part in content_blocks:
+        if hasattr(part, "text"):
+            parts.append({"type": "text", "text": part.text})
+        elif hasattr(part, "data"):  # ImageContent: base64-encoded bytes
+            parts.append({
+                "type": "image",
+                "mimeType": getattr(part, "mimeType", "application/octet-stream"),
+                "data": part.data,
+            })
+        elif hasattr(part, "resource"):  # EmbeddedResource
+            resource = part.resource
+            if hasattr(resource, "text"):
+                parts.append({"type": "text", "text": resource.text})
+            elif hasattr(resource, "blob"):
+                parts.append({
+                    "type": "resource",
+                    "mimeType": getattr(resource, "mimeType", "application/octet-stream"),
+                    "uri": getattr(resource, "uri", ""),
+                })
+
+    # Simplify: if every block is plain text, return a single string
+    if all(p["type"] == "text" for p in parts):
+        return "\n".join(p["text"] for p in parts)
+    return parts
+
+
 # ── Trust levels ─────────────────────────────────────────────────────────────
 
 TRUST_LEVELS = ("local", "trusted", "external")
@@ -65,6 +112,10 @@ class MCPToolInfo:
     input_schema: dict
     server_name: str
     trust_level: str
+    # True when the MCP server declares readOnlyHint=True for this tool.
+    # Used by the approval gate: write tools on servers with allow_side_effects=False
+    # are blocked at the router level rather than silently executed.
+    read_only: bool = False
 
 
 @dataclass
@@ -150,6 +201,7 @@ def load_mcp_config(config_path: str | None = None) -> list[MCPServerConfig]:
                 args=args,
                 env=env,
                 trust_level=entry.get("trust_level", "external"),
+                allow_side_effects=bool(entry.get("allow_side_effects", False)),
             ))
         except ValueError as e:
             logger.warning("mcp_config_invalid_server",
@@ -257,12 +309,23 @@ class MCPClient:
                 session.list_tools(), timeout=TOOLS_TIMEOUT
             )
             for tool in tools_result.tools:
+                # Extract readOnlyHint from MCP tool annotations if present.
+                # Default False (conservative): unknown tools may have side effects.
+                annotations = getattr(tool, "annotations", None) or {}
+                if hasattr(annotations, "readOnlyHint"):
+                    read_only = bool(annotations.readOnlyHint)
+                elif isinstance(annotations, dict):
+                    read_only = bool(annotations.get("readOnlyHint", False))
+                else:
+                    read_only = False
+
                 info = MCPToolInfo(
                     name=tool.name,
                     description=tool.description or "",
                     input_schema=tool.inputSchema if hasattr(tool, "inputSchema") else {},
                     server_name=config.name,
                     trust_level=config.trust_level,
+                    read_only=read_only,
                 )
                 conn.tools.append(info)
                 # Namespace to avoid collisions: mcp_{server}_{tool}
@@ -305,7 +368,10 @@ class MCPClient:
         for qualified_name, info in self._tool_index.items():
             tools.append({
                 "type": "function",
-                "side_effects": True,  # conservative default for external tools
+                # side_effects drives parallel vs sequential dispatch in _handle_tool_calls.
+                # read_only=True (from MCP readOnlyHint annotation) means no side effects;
+                # unknown or False means conservative: treat as a side-effect call.
+                "side_effects": not info.read_only,
                 "function": {
                     "name": qualified_name,
                     "description": (
@@ -375,25 +441,28 @@ class MCPClient:
                 timeout=CALL_TIMEOUT,
             )
 
-            # Extract text content from MCP result
-            content_parts = []
-            for part in (result.content or []):
-                if hasattr(part, 'text'):
-                    content_parts.append(part.text)
-
             duration_ms = round((time.perf_counter() - started_at) * 1000)
+            is_error = bool(getattr(result, 'isError', False))
             logger.info(
                 "mcp_tool_call_completed",
                 server=server_name,
                 tool=tool_name,
                 duration_ms=duration_ms,
-                is_error=result.isError if hasattr(result, 'isError') else False,
+                is_error=is_error,
             )
 
-            if hasattr(result, 'isError') and result.isError:
-                return {"error": "\n".join(content_parts) or "MCP tool returned an error"}
+            if is_error:
+                error_text = _extract_text_content(result.content or [])
+                return {"error": error_text or "MCP tool returned an error"}
 
-            return {"result": "\n".join(content_parts)}
+            # Prefer structuredContent (newer MCP servers) — richer and already
+            # parsed; the model can use it directly without text extraction.
+            structured = getattr(result, 'structuredContent', None)
+            if structured is not None:
+                return {"result": structured}
+
+            # Fall back to content blocks: text, images, embedded resources.
+            return {"result": _extract_content(result.content or [])}
 
         except Exception as e:
             duration_ms = round((time.perf_counter() - started_at) * 1000)

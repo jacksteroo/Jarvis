@@ -99,9 +99,40 @@ class ToolRouter:
         if not info:
             return {"error": f"MCP tool info not found: {qualified_name}"}
 
-        # Privacy enforcement: check trust boundary BEFORE calling
+        # Side-effects gate: block write tools on servers that haven't opted in.
+        # This enforces the repo guardrail that consequential external actions
+        # (creating GitHub issues, writing to Notion, mutating the filesystem, etc.)
+        # require explicit user approval — not just the model deciding to call a tool.
+        # local servers are always allowed; the gate only applies to external/trusted.
+        conn = self._mcp_client.servers.get(server_name)
+        if conn and not conn.config.allow_side_effects and not info.read_only:
+            if info.trust_level != "local":
+                msg = (
+                    f"MCP tool '{tool_name}' on server '{server_name}' has side effects "
+                    f"and is blocked: allow_side_effects is not enabled for this server. "
+                    f"Review the server's tool list, then set allow_side_effects: true "
+                    f"in config/mcp_servers.yaml to permit write operations."
+                )
+                logger.warning(
+                    "mcp_write_tool_blocked",
+                    server=server_name,
+                    tool=tool_name,
+                    trust_level=info.trust_level,
+                )
+                log_mcp_call(
+                    server_name=server_name,
+                    trust_level=info.trust_level,
+                    tool_name=tool_name,
+                    duration_ms=0,
+                    success=False,
+                    error=msg,
+                )
+                return {"error": msg}
+
+        # Privacy enforcement: check trust boundary BEFORE calling.
+        # Pass arguments so the oversized-payload scan runs on the actual outbound data.
         try:
-            check_trust_boundary(server_name, info.trust_level, tool_name)
+            check_trust_boundary(server_name, info.trust_level, tool_name, arguments)
         except MCPPrivacyViolation as violation:
             log_mcp_call(
                 server_name=server_name,

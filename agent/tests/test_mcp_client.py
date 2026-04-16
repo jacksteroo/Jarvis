@@ -15,6 +15,7 @@ from agent.mcp_client import (
     MCPClient,
     MCPServerConfig,
     MCPToolInfo,
+    _extract_content,
     load_mcp_config,
 )
 
@@ -394,3 +395,109 @@ def test_rate_limit_expires_old_calls():
     client._call_times["ext"] = [0.0] * 100  # ancient timestamps
     result = client._check_rate_limit("ext", "external")
     assert result is None
+
+
+# ── _extract_content helper ───────────────────────────────────────────────────
+
+
+class _FakeText:
+    def __init__(self, text): self.text = text
+
+class _FakeImage:
+    def __init__(self, data, mime): self.data = data; self.mimeType = mime
+
+class _FakeResourceText:
+    def __init__(self, text): self.text = text
+
+class _FakeEmbedded:
+    def __init__(self, resource): self.resource = resource
+
+
+class TestExtractContent:
+    """Regression tests for _extract_content (Fix 4 / P2).
+
+    _extract_content must handle text, images, and embedded resources —
+    not just TextContent blocks.  All-text results simplify to a plain string;
+    mixed results return a list of typed dicts so no information is lost.
+    """
+
+    def test_empty_content_returns_empty_string(self):
+        assert _extract_content([]) == ""
+
+    def test_single_text_block_returns_string(self):
+        result = _extract_content([_FakeText("hello")])
+        assert result == "hello"
+
+    def test_multiple_text_blocks_joined(self):
+        result = _extract_content([_FakeText("line 1"), _FakeText("line 2")])
+        assert result == "line 1\nline 2"
+
+    def test_image_block_preserved_in_mixed_output(self):
+        result = _extract_content([_FakeText("caption"), _FakeImage("abc==", "image/png")])
+        assert isinstance(result, list)
+        types = {p["type"] for p in result}
+        assert "text" in types
+        assert "image" in types
+        img = next(p for p in result if p["type"] == "image")
+        assert img["data"] == "abc=="
+        assert img["mimeType"] == "image/png"
+
+    def test_embedded_text_resource_extracted(self):
+        resource = _FakeResourceText("resource text here")
+        result = _extract_content([_FakeEmbedded(resource)])
+        # Single embedded text resource simplifies to a plain string
+        assert result == "resource text here"
+
+    def test_image_only_returns_list(self):
+        result = _extract_content([_FakeImage("data", "image/jpeg")])
+        assert isinstance(result, list)
+        assert result[0]["type"] == "image"
+
+    def test_all_text_blocks_simplify_to_string(self):
+        """When every block is text, the result is a plain string, not a list."""
+        blocks = [_FakeText(f"part {i}") for i in range(5)]
+        result = _extract_content(blocks)
+        assert isinstance(result, str)
+        assert "part 0" in result and "part 4" in result
+
+
+def test_load_config_reads_allow_side_effects():
+    """allow_side_effects is parsed from YAML and stored on the config object."""
+    import tempfile
+    data = {
+        "servers": [
+            {"name": "gh", "command": "npx", "trust_level": "external",
+             "allow_side_effects": True},
+            {"name": "local", "command": "python", "trust_level": "local"},
+        ]
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(data, f)
+        f.flush()
+        configs = load_mcp_config(f.name)
+    os.unlink(f.name)
+
+    gh = next(c for c in configs if c.name == "gh")
+    local = next(c for c in configs if c.name == "local")
+    assert gh.allow_side_effects is True
+    assert local.allow_side_effects is False  # conservative default
+
+
+def test_get_tools_side_effects_flag_reflects_read_only():
+    """get_tools sets side_effects=False for read-only tools, True for others."""
+    client = MCPClient()
+
+    read_info = MCPToolInfo(
+        name="search", description="Search", input_schema={},
+        server_name="gh", trust_level="external", read_only=True,
+    )
+    write_info = MCPToolInfo(
+        name="create", description="Create", input_schema={},
+        server_name="gh", trust_level="external", read_only=False,
+    )
+    client._tool_index["mcp_gh_search"] = read_info
+    client._tool_index["mcp_gh_create"] = write_info
+
+    tools = {t["function"]["name"]: t for t in client.get_tools()}
+    assert tools["mcp_gh_search"]["side_effects"] is False
+    assert tools["mcp_gh_create"]["side_effects"] is True

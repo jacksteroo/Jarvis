@@ -242,7 +242,7 @@ def log_mcp_call(
     error: str | None = None,
 ) -> None:
     """Log an MCP tool call to the audit trail."""
-    data_class = classify_tool_data(tool_name)
+    data_class = classify_tool_data(tool_name, server_trust_level=trust_level)
     entry = AuditEntry(
         timestamp=datetime.now(timezone.utc).isoformat(),
         server_name=server_name,

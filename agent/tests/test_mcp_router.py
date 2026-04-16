@@ -185,6 +185,67 @@ class TestMCPToolSuccessPath:
             assert call_kwargs["error"] == "something went wrong"
 
 
+class TestMCPWriteToolGate:
+    """Regression tests for the MCP write-tool approval gate (Fix 2 / P1).
+
+    Write tools on non-local servers with allow_side_effects=False must be
+    blocked by the router before they reach the MCP client.  The gate must
+    NOT apply to local servers, and must NOT apply when allow_side_effects=True
+    or when the tool is declared read-only via MCP readOnlyHint.
+    """
+
+    @pytest.mark.asyncio
+    async def test_write_tool_blocked_on_external_server_by_default(self, router_with_mcp):
+        """External server with allow_side_effects=False blocks write tools."""
+        result = await router_with_mcp.call_mcp_tool("mcp_github_create_issue", {})
+        assert "error" in result
+        assert "allow_side_effects" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_write_tool_allowed_when_side_effects_enabled(self, router_with_mcp):
+        """Setting allow_side_effects=True on the server config permits write tools."""
+        router_with_mcp._mcp_client.servers["github"].config.allow_side_effects = True
+        router_with_mcp._mcp_client.call_tool = AsyncMock(return_value={"result": "created"})
+        result = await router_with_mcp.call_mcp_tool("mcp_github_create_issue", {"title": "bug"})
+        assert "error" not in result
+        assert result == {"result": "created"}
+
+    @pytest.mark.asyncio
+    async def test_read_only_tool_bypasses_gate_even_without_side_effects(self, router_with_mcp):
+        """A tool with read_only=True is allowed even when allow_side_effects=False."""
+        # Register a read-only search tool on the external github server
+        read_info = MCPToolInfo(
+            name="search_issues",
+            description="Search GitHub issues",
+            input_schema={},
+            server_name="github",
+            trust_level="external",
+            read_only=True,
+        )
+        router_with_mcp._mcp_client._tool_index["mcp_github_search_issues"] = read_info
+        router_with_mcp._mcp_client.call_tool = AsyncMock(return_value={"result": "issues list"})
+        result = await router_with_mcp.call_mcp_tool("mcp_github_search_issues", {"q": "bug"})
+        assert "error" not in result
+        assert result == {"result": "issues list"}
+
+    @pytest.mark.asyncio
+    async def test_local_server_bypasses_write_gate(self, router_with_mcp):
+        """Local servers are fully trusted — the write gate does not apply."""
+        # Register a write tool on the local filesystem server
+        write_info = MCPToolInfo(
+            name="write_file",
+            description="Write a local file",
+            input_schema={},
+            server_name="filesystem",
+            trust_level="local",
+            read_only=False,
+        )
+        router_with_mcp._mcp_client._tool_index["mcp_filesystem_write_file"] = write_info
+        router_with_mcp._mcp_client.call_tool = AsyncMock(return_value={"result": "written"})
+        result = await router_with_mcp.call_mcp_tool("mcp_filesystem_write_file", {"path": "/tmp/x", "content": "y"})
+        assert "error" not in result
+
+
 class TestRouterStatus:
 
     def test_status_includes_mcp(self, router_with_mcp):
