@@ -115,14 +115,24 @@ class TestMCPToolRouting:
 
     @pytest.mark.asyncio
     async def test_call_mcp_tool_privacy_violation(self, router_with_mcp):
-        """External server cannot call raw personal data tools."""
-        # Manually register a raw personal tool on external server
+        """External server cannot call raw personal data tools.
+
+        The call is blocked by whichever gate fires first:
+        - the side-effects gate (allow_side_effects=False + not read_only), or
+        - the privacy trust-boundary check (RAW_PERSONAL tool on external server).
+        Both are correct outcomes; the test asserts on the error presence only.
+        To exercise the privacy gate specifically (after the side-effects gate has
+        been bypassed), we mark the tool read_only=True so only the trust-boundary
+        check applies.
+        """
+        # read_only=True bypasses the side-effects gate so the privacy check fires.
         info = MCPToolInfo(
             name="get_recent_imessages",
             description="Read iMessages",
             input_schema={},
             server_name="github",
             trust_level="external",
+            read_only=True,
         )
         router_with_mcp._mcp_client._tool_index["mcp_github_get_recent_imessages"] = info
 
