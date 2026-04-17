@@ -395,3 +395,167 @@ def test_validate_prompt_tool_references_no_stale_names():
         f"Capability block references nonexistent tools: {unknown}\n"
         "Update build_capability_block() to use the correct registered tool names."
     )
+
+
+# ── Phase 6.5 — Router hardening ──────────────────────────────────────────────
+
+class _FakeCapability:
+    def __init__(self, status):
+        self.status = status
+        self.detail = ""
+        self.display_name = "fake"
+
+    @property
+    def source(self):
+        return "fake"
+
+
+class _FakeRegistry:
+    """Minimal stand-in for CapabilityRegistry used by routing tests."""
+
+    def __init__(self, statuses: dict):
+        # statuses maps registry-key → CapabilityStatus
+        self._statuses = statuses
+
+    def get_status(self, source: str):
+        from agent.capability_registry import CapabilityStatus
+        return self._statuses.get(source, CapabilityStatus.NOT_CONFIGURED)
+
+    def get(self, source: str):
+        if source in self._statuses:
+            return _FakeCapability(self._statuses[source])
+        return None
+
+
+# — Possessive entity extraction ——————————————————————————————————————————
+
+def test_extract_possessive_name():
+    targets = _extract_entity_targets("Mike's latest email")
+    assert "Mike" in targets
+
+
+def test_extract_possessive_kinship():
+    targets = _extract_entity_targets("reply to my mom's message")
+    assert "mom" in [t.lower() for t in targets]
+
+
+def test_extract_possessive_contraction_not_a_name():
+    # "it's" and "that's" must NOT match the possessive pattern
+    targets = _extract_entity_targets("it's urgent")
+    assert targets == []
+
+
+def test_possessive_name_routes_as_person_lookup(router):
+    d = router.route("Mike's latest email")
+    assert d.intent_type == IntentType.PERSON_LOOKUP
+    assert "Mike" in d.entity_targets
+
+
+# — Relative / event-relative time scopes —————————————————————————————————
+
+@pytest.mark.parametrize("message,expected", [
+    ("anything since Thursday?", "since_thursday"),
+    ("show me anything since monday", "since_monday"),
+    ("emails in the last 4 hours", "last_4_hour"),
+    ("over the last 3 days", "last_3_day"),
+    ("what do I have before my 3pm?", "before_3pm"),
+    ("before my meeting", "before_meeting"),
+    ("anything over the last few days?", "past_few_days"),
+])
+def test_relative_time_scopes(message, expected):
+    assert _infer_time_scope(message) == expected
+
+
+# — Short conversation carry-over ——————————————————————————————————————————
+
+def test_carry_over_inherits_email(router):
+    prior = ["Did anything important come in by email today?"]
+    d = router.route("anything urgent?", recent_user_messages=prior)
+    assert "email" in d.target_sources
+    assert "carried over" in d.reasoning.lower()
+
+
+def test_carry_over_does_not_fire_for_fresh_unrelated_query(router):
+    prior = ["Did anything important come in by email today?"]
+    d = router.route("how do I reverse a list in python?", recent_user_messages=prior)
+    # Fresh unrelated question: no email carry-over
+    assert "email" not in d.target_sources
+
+
+def test_carry_over_does_not_overwrite_explicit_source(router):
+    prior = ["any emails?"]
+    d = router.route("any texts?", recent_user_messages=prior)
+    # Explicit "texts" → imessage, not email
+    assert "imessage" in d.target_sources
+    assert "email" not in d.target_sources
+
+
+# — Registry filtering (registry-aware routing) ——————————————————————————
+
+def test_registry_narrows_to_available_sources(router):
+    from agent.capability_registry import CapabilityStatus
+    reg = _FakeRegistry({
+        "email_gmail": CapabilityStatus.AVAILABLE,
+        "email_yahoo": CapabilityStatus.NOT_CONFIGURED,
+        "imessage": CapabilityStatus.PERMISSION_REQUIRED,
+    })
+    # Asking for texts when imessage needs permission AND email is available:
+    # a single-source texts query should flag needs_clarification.
+    d = router.route("any texts?", capability_registry=reg)
+    assert d.needs_clarification is True
+    # Original target preserved so UI can render the gap
+    assert "imessage" in d.target_sources
+
+
+def test_registry_keeps_reachable_sources(router):
+    from agent.capability_registry import CapabilityStatus
+    reg = _FakeRegistry({
+        "email_gmail": CapabilityStatus.AVAILABLE,
+        "slack": CapabilityStatus.AVAILABLE,
+        "imessage": CapabilityStatus.PERMISSION_REQUIRED,
+    })
+    d = router.route("check my email and slack", capability_registry=reg)
+    assert "email" in d.target_sources
+    assert "slack" in d.target_sources
+    assert d.needs_clarification is False
+
+
+def test_registry_drops_unavailable_keeps_available(router):
+    from agent.capability_registry import CapabilityStatus
+    reg = _FakeRegistry({
+        "email_gmail": CapabilityStatus.AVAILABLE,
+        "slack": CapabilityStatus.NOT_CONFIGURED,
+    })
+    d = router.route("any updates from email or slack?", capability_registry=reg)
+    # slack is dropped; email remains
+    assert "email" in d.target_sources
+    assert "slack" not in d.target_sources
+    assert d.needs_clarification is False
+
+
+# — Multi-intent split ——————————————————————————————————————————————————
+
+def test_route_multi_single_intent_passthrough(router):
+    decisions = router.route_multi("any emails today?")
+    assert len(decisions) == 1
+    assert decisions[0].intent_type in {
+        IntentType.INBOX_SUMMARY, IntentType.CONVERSATION_LOOKUP,
+    }
+
+
+def test_route_multi_splits_clear_conjunction(router):
+    decisions = router.route_multi("any emails and what's on my calendar?")
+    assert len(decisions) == 2
+    intents = {d.intent_type for d in decisions}
+    assert IntentType.SCHEDULE_LOOKUP in intents
+
+
+def test_route_multi_does_not_split_action_tail(router):
+    # "check email and tell me what's urgent" — single compound intent, not a split
+    decisions = router.route_multi("check email and tell me what's urgent")
+    assert len(decisions) == 1
+
+
+def test_route_multi_splits_on_semicolon(router):
+    decisions = router.route_multi("any emails; what's on my calendar")
+    assert len(decisions) == 2

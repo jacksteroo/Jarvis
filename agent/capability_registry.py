@@ -123,6 +123,74 @@ class CapabilityRegistry:
                 detail=detail[:120] if detail else "",
             )
 
+    def classify_tool_error(self, tool_name: str, error: str) -> None:
+        """Phase 6.6: map a tool-call error to a registry status update.
+
+        Recognizable auth/permission patterns update the matching source so the
+        next turn's prompt and router reflect the new reality — a permission
+        revoked mid-session does not wait for a restart to propagate.
+        """
+        if not error:
+            return
+        err_lower = error.lower()
+
+        # Map tool-name prefixes to registry source keys.
+        tool_to_source: list[tuple[tuple[str, ...], str]] = [
+            (("get_recent_imessages", "get_imessage_", "search_imessages"), "imessage"),
+            (("get_recent_whatsapp", "get_whatsapp_", "search_whatsapp"), "whatsapp"),
+            (("search_slack", "get_slack_", "list_slack_"), "slack"),
+            (("get_upcoming_events", "get_calendar_", "list_calendars"), "calendar_google"),
+            (("search_web", "search_images"), "web_search"),
+        ]
+        source_key: str | None = None
+        for prefixes, key in tool_to_source:
+            if any(tool_name.startswith(p) for p in prefixes):
+                source_key = key
+                break
+        # Email tools span Gmail + Yahoo; update whichever the error names, or both
+        if tool_name.startswith(("get_recent_emails", "search_emails", "get_email_")):
+            if "gmail" in err_lower:
+                source_key = "email_gmail"
+            elif "yahoo" in err_lower:
+                source_key = "email_yahoo"
+            else:
+                # Ambiguous — skip update to avoid flipping both to an error state
+                # based on a vague message.
+                return
+
+        if not source_key or source_key not in self._sources:
+            return
+
+        permission_markers = (
+            "permission", "full disk access", "fda", "forbidden",
+            "operation not permitted", "access denied", "not authorized",
+        )
+        auth_markers = (
+            "401", "unauthorized", "invalid_grant", "token expired",
+            "credentials", "authentication",
+        )
+        transient_markers = (
+            "timeout", "temporarily", "503", "502", "504", "connection",
+            "rate limit", "too many requests", "429",
+        )
+
+        if any(m in err_lower for m in permission_markers):
+            self.update_status(source_key, CapabilityStatus.PERMISSION_REQUIRED, error[:200])
+        elif any(m in err_lower for m in auth_markers):
+            self.update_status(source_key, CapabilityStatus.NOT_CONFIGURED, error[:200])
+        elif any(m in err_lower for m in transient_markers):
+            self.update_status(source_key, CapabilityStatus.TEMPORARILY_UNAVAILABLE, error[:200])
+        # Unknown error patterns don't get mapped — avoid spurious state changes.
+
+    async def refresh(self, config) -> None:
+        """Re-probe all sources. Used by the periodic scheduler and on-demand retry.
+
+        Thin wrapper around populate() so callers have a clear "refresh" verb.
+        """
+        logger.info("capability_registry_refresh_start")
+        await self.populate(config)
+        logger.info("capability_registry_refresh_complete")
+
     def get(self, source: str) -> SourceCapability | None:
         return self._sources.get(source)
 

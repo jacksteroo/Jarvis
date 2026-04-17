@@ -144,6 +144,7 @@ _PERSON_DID_RE = re.compile(
     r"(send|sent|message[ds]?|email[ds]?|text(?:ed)?|call(?:ed)?|reach(?:ed)?|reply|replied|respond(?:ed)?|write|written|get|gotten|hear|heard)",
     re.IGNORECASE,
 )
+
 # Common kinship / relation terms that appear in lowercase in natural speech.
 # Matched case-insensitively in _*_KINSHIP_RE patterns below, but in a SEPARATE
 # regex from the title-case name pattern so that [A-Z][a-z]+ stays case-SENSITIVE
@@ -170,6 +171,19 @@ _ABOUT_KINSHIP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Possessive name patterns: "Mike's email", "Sarah's thread", "reply to Sarah's message"
+# Title-case only so common words like "it's", "that's" don't match.
+_POSSESSIVE_NAME_RE = re.compile(
+    r"\b([A-Z][a-z]+)'s\s+"
+    r"(email|emails|message|messages|thread|threads|reply|text|texts|note|notes|latest|recent|last)\b"
+)
+# Possessive kinship: "my mom's email", "my boss's thread"
+_POSSESSIVE_KINSHIP_RE = re.compile(
+    r"\b(?:my\s+)?" + _KINSHIP_PAT + r"['\u2019]s\s+"
+    r"(email|emails|message|messages|thread|threads|reply|text|texts|note|notes|latest|recent|last)\b",
+    re.IGNORECASE,
+)
+
 # Known data source names that should not be treated as person entities
 _SOURCE_NAME_BLOCKLIST = frozenset({
     "slack", "gmail", "yahoo", "whatsapp", "imessage", "telegram", "email",
@@ -184,7 +198,24 @@ _TIME_SCOPE_TABLE: tuple[tuple[tuple[str, ...], str], ...] = (
     (("today", "tonight"), "today"),
     (("yesterday",), "yesterday"),
     (("this week", "past week", "last week"), "this_week"),
+    (("past few days", "last few days", "over the last few days", "couple of days"), "past_few_days"),
     (("last hour", "past hour", "just now", "recently"), "last_hour"),
+)
+
+# "since Thursday", "since Monday", etc. — dynamic day-of-week anchor.
+_SINCE_DOW_RE = re.compile(
+    r"\bsince\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+# "in the last N hours/days", "over the last N hours/days"
+_LAST_N_RE = re.compile(
+    r"\b(?:in|over|for)\s+the\s+last\s+(\d+)\s+(hour|hours|day|days|week|weeks)\b",
+    re.IGNORECASE,
+)
+# "before my 3pm", "before my 3:30", "before my meeting", "before my call"
+_BEFORE_EVENT_RE = re.compile(
+    r"\bbefore\s+my\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?|meeting|call|appointment|next\s+\w+)\b",
+    re.IGNORECASE,
 )
 
 
@@ -195,6 +226,21 @@ def _infer_time_scope(text: str) -> str:
     for phrases, scope in _TIME_SCOPE_TABLE:
         if any(p in normalized for p in phrases):
             return scope
+
+    # Dynamic scopes — emit a stable token the downstream code can reason about
+    m = _SINCE_DOW_RE.search(text)
+    if m:
+        return f"since_{m.group(1).lower()}"
+    m = _LAST_N_RE.search(text)
+    if m:
+        n = m.group(1)
+        unit = m.group(2).lower().rstrip("s")
+        return f"last_{n}_{unit}"
+    m = _BEFORE_EVENT_RE.search(text)
+    if m:
+        anchor = m.group(1).lower().replace(" ", "_")
+        return f"before_{anchor}"
+
     return "default"
 
 
@@ -244,6 +290,18 @@ def _extract_entity_targets(text: str) -> list[str]:
     for m in _ABOUT_KINSHIP_RE.finditer(text):
         word = m.group(0).split()[-1]
         _add(word)
+
+    # Possessive patterns: "Mike's email", "Sarah's thread"
+    for m in _POSSESSIVE_NAME_RE.finditer(text):
+        _add(m.group(1))
+
+    # Possessive kinship: "my mom's email" — extract the kinship term itself
+    for m in _POSSESSIVE_KINSHIP_RE.finditer(text):
+        # The kinship word is the token ending with "'s" or "'s"
+        for tok in m.group(0).split():
+            if "'" in tok or "\u2019" in tok:
+                _add(tok.split("'")[0].split("\u2019")[0])
+                break
 
     return list(dict.fromkeys(targets))  # deduplicate, preserve order
 
@@ -309,8 +367,14 @@ class QueryRouter:
         self,
         user_message: str,
         capability_registry: "CapabilityRegistry | None" = None,
+        recent_user_messages: list[str] | None = None,
     ) -> RoutingDecision:
-        """Return a RoutingDecision for the given message."""
+        """Return a RoutingDecision for the given message.
+
+        recent_user_messages: previous user turns (most-recent last) used to
+        inherit source context for short follow-ups like "anything urgent?"
+        after an email question.
+        """
         normalized = normalize_user_text(user_message)
         time_scope = _infer_time_scope(user_message)
         entity_targets = _extract_entity_targets(user_message)
@@ -357,6 +421,31 @@ class QueryRouter:
         # "Any word from David?" better than triage handles it.
         if contains_any(normalized, _CROSS_SOURCE_TERMS) and not entity_targets:
             sources = _infer_target_sources(user_message)
+            reason = "cross-source triage phrase"
+            confidence = 1.0
+            # Phase 6.5: if no explicit source and the prior turn named one,
+            # inherit it instead of fanning out to every channel.
+            if not sources and recent_user_messages and len(user_message.split()) <= 6:
+                for prior in reversed(recent_user_messages[-2:]):
+                    prior_sources = _infer_target_sources(prior)
+                    if prior_sources:
+                        sources = prior_sources
+                        reason = "cross-source triage phrase (carried over)"
+                        confidence = 0.7
+                        # Downgrade to INBOX_SUMMARY since we have a specific source
+                        intent_type = IntentType.INBOX_SUMMARY
+                        d = RoutingDecision(
+                            intent_type=intent_type,
+                            target_sources=sources,
+                            action_mode=ActionMode.CALL_TOOLS,
+                            time_scope=time_scope,
+                            entity_targets=entity_targets,
+                            reasoning=reason,
+                            confidence=confidence,
+                        )
+                        self._log(user_message, d)
+                        return self._apply_registry(d, capability_registry)
+
             if not sources:
                 sources = ["email", "imessage", "whatsapp", "slack"]
             d = RoutingDecision(
@@ -365,10 +454,11 @@ class QueryRouter:
                 action_mode=ActionMode.CALL_TOOLS,
                 time_scope=time_scope,
                 entity_targets=entity_targets,
-                reasoning="cross-source triage phrase",
+                reasoning=reason,
+                confidence=confidence,
             )
             self._log(user_message, d)
-            return d
+            return self._apply_registry(d, capability_registry)
 
         # ── 4. Person-centric lookup ───────────────────────────────────────────
         if entity_targets and (
@@ -376,6 +466,8 @@ class QueryRouter:
             or _FROM_PERSON_RE.search(user_message)
             or _FROM_KINSHIP_RE.search(user_message)
             or _ABOUT_KINSHIP_RE.search(user_message)
+            or _POSSESSIVE_NAME_RE.search(user_message)
+            or _POSSESSIVE_KINSHIP_RE.search(user_message)
             or contains_any(normalized, ("hear from", "heard from", "word from"))
         ):
             sources = _infer_target_sources(user_message)
@@ -390,7 +482,7 @@ class QueryRouter:
                 reasoning="person-lookup pattern",
             )
             self._log(user_message, d)
-            return d
+            return self._apply_registry(d, capability_registry)
 
         # ── 5. Schedule / calendar lookup ─────────────────────────────────────
         if contains_any(normalized, CALENDAR_QUERY_TERMS):
@@ -403,7 +495,7 @@ class QueryRouter:
                 reasoning="calendar terms",
             )
             self._log(user_message, d)
-            return d
+            return self._apply_registry(d, capability_registry)
 
         # ── 6. Action items ────────────────────────────────────────────────────
         if contains_any(normalized, ACTION_ITEM_INTENT_TERMS):
@@ -419,10 +511,32 @@ class QueryRouter:
                 reasoning="action-item terms",
             )
             self._log(user_message, d)
-            return d
+            return self._apply_registry(d, capability_registry)
 
         # ── 7 & 8. Source-targeted queries ────────────────────────────────────
         inferred = _infer_target_sources(user_message)
+
+        # Phase 6.5: carry-over from recent turns.
+        # "Anything urgent?" after an email question should inherit "email".
+        # Only kicks in when the current turn has no explicit source terms and
+        # is short/attention-shaped — longer queries are assumed to stand alone.
+        carried_over = False
+        if not inferred and recent_user_messages and len(user_message.split()) <= 8:
+            attention_shaped = (
+                contains_any(normalized, ATTENTION_INTENT_TERMS)
+                or contains_any(normalized, _CROSS_SOURCE_TERMS)
+                or normalized.startswith("any ")
+                or "what about" in normalized
+                or "and" == normalized.strip()
+            )
+            if attention_shaped:
+                for prior in reversed(recent_user_messages[-2:]):
+                    prior_sources = _infer_target_sources(prior)
+                    if prior_sources:
+                        inferred = prior_sources
+                        carried_over = True
+                        break
+
         if inferred:
             # "Any texts?", "Any emails?" → the word "any" at the start signals a
             # summary request even though it's not in ATTENTION_INTENT_TERMS.
@@ -440,6 +554,8 @@ class QueryRouter:
             else:
                 intent = IntentType.CONVERSATION_LOOKUP
                 reason = "source terms matched"
+            if carried_over:
+                reason = f"{reason} (carried over)"
             d = RoutingDecision(
                 intent_type=intent,
                 target_sources=inferred,
@@ -447,9 +563,10 @@ class QueryRouter:
                 time_scope=time_scope,
                 entity_targets=entity_targets,
                 reasoning=reason,
+                confidence=0.7 if carried_over else 1.0,
             )
             self._log(user_message, d)
-            return d
+            return self._apply_registry(d, capability_registry)
 
         # ── 9. General chat (fallback) ─────────────────────────────────────────
         d = RoutingDecision(
@@ -463,6 +580,119 @@ class QueryRouter:
         )
         self._log(user_message, d)
         return d
+
+    @staticmethod
+    def _apply_registry(
+        decision: RoutingDecision,
+        registry: "CapabilityRegistry | None",
+    ) -> RoutingDecision:
+        """Narrow target_sources to only live-available ones.
+
+        If a source hint maps to a registry entry that is NOT available, drop it.
+        If all hints are unavailable, set needs_clarification=True with a
+        reasoning string the LLM/UI can render as a precise explanation
+        instead of a generic apology.
+        """
+        if registry is None or not decision.target_sources:
+            return decision
+        if decision.target_sources == ["all"] or decision.target_sources == ["unknown"]:
+            return decision
+
+        from agent.capability_registry import CapabilityStatus, SOURCE_ALIASES
+
+        reachable: list[str] = []
+        dropped: list[tuple[str, str]] = []  # (hint, status)
+        for hint in decision.target_sources:
+            keys = SOURCE_ALIASES.get(hint.lower(), [hint])
+            # Hint is reachable if ANY mapped registry key is available.
+            statuses = []
+            any_available = False
+            for key in keys:
+                status = registry.get_status(key)
+                statuses.append(status.value)
+                if status == CapabilityStatus.AVAILABLE:
+                    any_available = True
+                    break
+            if any_available:
+                reachable.append(hint)
+            else:
+                # Only record as "dropped" if the registry actually knew about it.
+                if any(registry.get(k) for k in keys):
+                    dropped.append((hint, statuses[0] if statuses else "unknown"))
+                else:
+                    # No registry entry — keep the hint so routing is unchanged
+                    # for sources the registry doesn't track.
+                    reachable.append(hint)
+
+        if not reachable:
+            decision.needs_clarification = True
+            decision.reasoning = (
+                f"{decision.reasoning}; all sources unavailable "
+                f"({', '.join(f'{h}={s}' for h, s in dropped)})"
+            )
+            # Keep original sources so the clarifying question can list them.
+            return decision
+
+        if dropped:
+            decision.target_sources = reachable
+            decision.reasoning = (
+                f"{decision.reasoning}; narrowed to reachable "
+                f"(dropped: {', '.join(h for h, _ in dropped)})"
+            )
+        return decision
+
+    def route_multi(
+        self,
+        user_message: str,
+        capability_registry: "CapabilityRegistry | None" = None,
+        recent_user_messages: list[str] | None = None,
+    ) -> list[RoutingDecision]:
+        """Split a multi-intent query into a list of RoutingDecisions.
+
+        Splits on " and " / "; " only when each side independently parses as a
+        distinct source or entity target. Queries that don't split cleanly
+        return a single-element list wrapping the normal route() result.
+        """
+        # Only try splits when there's a plausible conjunction.
+        has_and = re.search(r"\s+and\s+", user_message, re.IGNORECASE) is not None
+        has_semi = ";" in user_message
+        if not (has_and or has_semi):
+            return [self.route(user_message, capability_registry, recent_user_messages)]
+
+        # Split on ";" first, then on " and " within each chunk.
+        chunks: list[str] = []
+        for semi_chunk in re.split(r";\s*", user_message):
+            if not semi_chunk.strip():
+                continue
+            parts = re.split(r"\s+and\s+", semi_chunk, flags=re.IGNORECASE)
+            chunks.extend(p.strip() for p in parts if p.strip())
+
+        if len(chunks) < 2:
+            return [self.route(user_message, capability_registry, recent_user_messages)]
+
+        # Each chunk must independently hit a source OR contain an entity target
+        # for the split to be worthwhile. Otherwise "check email and tell me" —
+        # where "tell me" is a bare action — should stay as a single intent.
+        decisions: list[RoutingDecision] = []
+        for chunk in chunks:
+            sources = _infer_target_sources(chunk)
+            entities = _extract_entity_targets(chunk)
+            if not sources and not entities:
+                return [self.route(user_message, capability_registry, recent_user_messages)]
+            decisions.append(self.route(chunk, capability_registry, recent_user_messages))
+
+        # Reject a split if every decision landed in GENERAL_CHAT — that means the
+        # split was meaningless and the whole message should be routed as one.
+        if all(d.intent_type == IntentType.GENERAL_CHAT for d in decisions):
+            return [self.route(user_message, capability_registry, recent_user_messages)]
+
+        logger.info(
+            "query_route_multi",
+            n_intents=len(decisions),
+            intents=[d.intent_type.value for d in decisions],
+            message_preview=user_message[:100],
+        )
+        return decisions
 
     @staticmethod
     def _log(user_message: str, decision: RoutingDecision) -> None:

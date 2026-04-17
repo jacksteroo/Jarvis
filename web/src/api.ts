@@ -135,6 +135,41 @@ export const api = {
 
   health: () => req<{ status: string }>('/health'),
 
+  getCapabilities: () =>
+    req<{
+      capabilities: Record<string, {
+        display_name: string
+        status: 'available' | 'not_configured' | 'permission_required' | 'temporarily_unavailable' | 'disabled'
+        detail: string
+        accounts: string[]
+      }>
+      available: string[]
+    }>('/capabilities'),
+
+  refreshCapabilities: () =>
+    req<{ ok: boolean; capabilities: Record<string, unknown>; available: string[] }>(
+      '/capabilities/refresh', { method: 'POST' }
+    ),
+
+  getPendingActions: () =>
+    req<{
+      pending: Array<{
+        id: string
+        tool_name: string
+        args: Record<string, unknown>
+        preview: string
+        model_description?: string
+        created_at: string
+      }>
+      count: number
+    }>('/pending-actions'),
+
+  actOnPending: (id: string, action: 'approve' | 'reject' | 'edit', edited_body?: string) =>
+    req<{ ok: boolean }>(`/pending-actions/${id}`, {
+      method: 'POST',
+      body: JSON.stringify({ action, edited_body }),
+    }),
+
   getCommsHealth: (quietDays = 14) =>
     req<{
       summary: {

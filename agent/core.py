@@ -15,6 +15,8 @@ from agent.query_router import QueryRouter, IntentType, ActionMode
 from agent.capability_registry import CapabilityRegistry
 from agent.mcp_client import MCPClient
 from agent.memory import MemoryManager
+from agent.pending_actions import PendingActionsQueue
+from agent.priority_grader import PriorityGrader, extract_vips_from_life_context
 from agent.memory_tools import MEMORY_TOOLS
 from agent.models import Conversation
 from agent.briefs import CommitmentExtractor
@@ -87,6 +89,41 @@ _MCP_WRITE_APPROVAL_RE = re.compile(
 # How long a pending MCP write approval stays valid (seconds).
 _MCP_APPROVAL_TTL = 300.0
 
+_PENDING_ACTION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "queue_outbound_action",
+            "description": (
+                "Queue a draft outbound action (e.g. send_email, send_imessage, send_whatsapp) "
+                "for explicit user approval before it executes. "
+                "Call this instead of executing a write tool directly whenever you have a draft "
+                "reply or message ready. The user will approve, edit, or reject it from the "
+                "Pepper status panel. Always use this for any action that sends a message, "
+                "creates a calendar event, or makes any external write."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "The write-tool to run on approval (e.g. 'send_email').",
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "Arguments to pass to tool_name when approved.",
+                    },
+                    "preview": {
+                        "type": "string",
+                        "description": "Short human-readable summary of what will be sent/created.",
+                    },
+                },
+                "required": ["tool_name", "args"],
+            },
+        },
+    }
+]
+
 IMAGE_TOOLS = [
     {
         "type": "function",
@@ -152,6 +189,21 @@ class PepperCore:
         self._router = QueryRouter()
         self._capability_registry = CapabilityRegistry()
 
+        # Phase 6.7: draft-and-queue for outbound actions. Executor is wired to
+        # the normal tool dispatcher so approved actions run through the same
+        # code path as any other tool call (logging, registry updates, etc).
+        # skip_mcp_write_gate=True: the pending-actions queue *is* the approval
+        # mechanism for these writes — re-running _check_mcp_write_gate here
+        # would immediately return approval_required (no matching per-session
+        # pending exists for the synthetic "pending_actions" session) and the
+        # queue would misclassify that as a successful send.
+        self.pending_actions = PendingActionsQueue()
+        self.pending_actions.set_executor(
+            lambda name, args: self._execute_tool(
+                name, args, session_id="pending_actions", skip_mcp_write_gate=True
+            )
+        )
+
     @staticmethod
     def _normalize_user_text(text: str) -> str:
         return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text.lower())).strip()
@@ -194,8 +246,150 @@ class PepperCore:
 
         return summary
 
-    @staticmethod
-    def _format_email_action_items_response(result: dict, account_scope: str) -> str:
+    def _make_grader(self) -> PriorityGrader:
+        """Build a PriorityGrader seeded with VIPs from life-context."""
+        from agent.life_context import load_life_context
+        lc = load_life_context(self.config.LIFE_CONTEXT_PATH)
+        vips = extract_vips_from_life_context(lc)
+        return PriorityGrader(vips=vips)
+
+    def _apply_priority_tags_to_attention(
+        self, result: dict, source_label: str
+    ) -> str:
+        """Re-rank and tag items in an attention/triage result by priority.
+
+        Used for iMessage / WhatsApp / cross-source triage flows so users see
+        a consistent [urgent]/[important] tag across channels rather than
+        priority grading only appearing in email-specific formatters.
+
+        Falls back to the original summary if items are missing or grading
+        fails for any reason — priority tags are informational; a regression
+        here must never hide the underlying data.
+        """
+        summary = result.get("summary", "")
+        items = result.get("items") or []
+        if not items:
+            return summary
+        try:
+            grader = self._make_grader()
+            # Build grader inputs. Attention items use `sender`/`text`/`display_name`/`name`;
+            # map them into the shape GradeInput.from_dict understands.
+            def _to_grade_input(it: dict) -> dict:
+                return {
+                    "sender": it.get("sender") or it.get("display_name") or it.get("name") or "",
+                    "preview": it.get("text") or "",
+                    "channel": source_label.lower(),
+                }
+
+            tagged = [(it, grader.grade(_to_grade_input(it))) for it in items]
+            # Stable priority order, preserving original order within a tag.
+            rank = {"urgent": 0, "important": 1, "defer": 2, "ignore": 3}
+            tagged.sort(key=lambda p: rank.get(p[1], 99))
+
+            lines = [f"I found {len(items)} {source_label} conversation(s) worth your attention:"]
+            for idx, (item, tag) in enumerate(tagged, start=1):
+                tag_label = f" [{tag}]" if tag in ("urgent", "important") else ""
+                display = item.get("display_name") or item.get("name") or ""
+                sender = item.get("sender", "")
+                sender_prefix = (
+                    f"{sender}: " if sender and sender not in {"unknown", "me", "You"} else ""
+                )
+                snippet = item.get("text") or "Latest readable text unavailable."
+                unread = item.get("unread_count") or 0
+                unread_tag = f" [{unread} unread]" if unread else ""
+                lines.append(
+                    f'{idx}. {display}{unread_tag}{tag_label} — '
+                    f'Last message: "{sender_prefix}{snippet}".'
+                )
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.warning(
+                "priority_tag_apply_failed",
+                source=source_label,
+                error=str(exc),
+            )
+            return summary
+
+    async def _maybe_build_priority_routed_summary(
+        self,
+        user_message: str,
+        routings: list,
+    ) -> str | None:
+        """Build a deterministic priority-tagged summary for routed inbox/triage asks.
+
+        This covers the broader Phase 6.7 inbox-summary / cross-source-triage
+        paths, not just the source-specific email/iMessage/WhatsApp shortcuts.
+        Mixed-intent turns (for example, inbox + calendar) are left alone so the
+        existing multi-intent path can handle the non-summary leg too.
+        """
+        relevant_intents = {IntentType.INBOX_SUMMARY, IntentType.CROSS_SOURCE_TRIAGE}
+        if not routings or any(r.intent_type not in relevant_intents for r in routings):
+            return None
+
+        sources: list[str] = []
+        for routing in routings:
+            for source in routing.target_sources:
+                if source in {"all", "unknown"}:
+                    continue
+                if source not in sources:
+                    sources.append(source)
+
+        if not sources:
+            # Generic "what needs my attention?" triage defaults to comms.
+            sources = ["email", "imessage", "whatsapp", "slack"]
+
+        sections: list[str] = []
+        email_hours = detect_email_time_window_hours(user_message)
+
+        if "email" in sources:
+            result = await execute_get_email_summary(
+                {"account": "all", "count": 8, "hours": email_hours}
+            )
+            if "error" in result:
+                sections.append(f"Email: unavailable ({result['error']})")
+            elif result.get("emails"):
+                sections.append(f"Email:\n{self._format_email_summary_response(result, 'all')}")
+
+        if "imessage" in sources:
+            result = await execute_get_recent_imessage_attention(
+                {"limit": 6, "days": 30, "message_limit": 3}
+            )
+            if "error" in result:
+                sections.append(f"iMessage: unavailable ({result['error']})")
+            else:
+                text = self._apply_priority_tags_to_attention(result, source_label="iMessage")
+                if text:
+                    sections.append(f"iMessage:\n{text}")
+
+        if "whatsapp" in sources:
+            result = await execute_get_recent_whatsapp_attention(
+                {"limit": 6, "message_limit": 3}
+            )
+            if "error" in result:
+                sections.append(f"WhatsApp: unavailable ({result['error']})")
+            else:
+                text = self._apply_priority_tags_to_attention(result, source_label="WhatsApp")
+                if text:
+                    sections.append(f"WhatsApp:\n{text}")
+
+        if "slack" in sources:
+            sections.append(
+                "Slack:\nI can check Slack directly, but I don't have a generic "
+                "priority triage scan for it yet. Ask for a channel or keyword and "
+                "I'll dig in."
+            )
+
+        if not sections:
+            return None
+
+        heading = (
+            "Here’s what looks most important across your inbox and messages:"
+            if len(sections) > 1
+            else "Here’s what stands out:"
+        )
+        return "\n\n".join([heading, *sections])
+
+    def _format_email_action_items_response(self, result: dict, account_scope: str) -> str:
         if "error" in result:
             return f"I couldn't scan your email inboxes: {result['error']}"
 
@@ -213,17 +407,19 @@ class PepperCore:
                 "I don't see any obvious action items."
             )
         else:
+            grader = self._make_grader()
             lines = [f"I found {len(action_items)} likely action item(s) in {scope_text}:"]
             for item in action_items:
-                lines.append(f"- {item['formatted']}")
+                tag = grader.grade(item)
+                tag_label = f" [{tag}]" if tag in ("urgent", "important") else ""
+                lines.append(f"- {item['formatted']}{tag_label}")
             response = "\n".join(lines)
 
         if warnings:
             response += "\n\nWarnings: " + "; ".join(warnings)
         return response
 
-    @staticmethod
-    def _format_email_summary_response(result: dict, account_scope: str) -> str:
+    def _format_email_summary_response(self, result: dict, account_scope: str) -> str:
         if "error" in result:
             return f"I couldn't scan your email inboxes: {result['error']}"
 
@@ -240,18 +436,34 @@ class PepperCore:
         if not emails:
             response = f"I don't see any emails in {scope_text} from the last {hours} hours."
         else:
+            grader = self._make_grader()
             lines = [f"I found {len(emails)} email(s) in {scope_text} from the last {hours} hours."]
             if important:
                 lines.append("")
                 lines.append("Most important:")
                 for item in important:
-                    lines.append(f"- {item['formatted']}")
+                    tag = grader.grade(item)
+                    tag_label = f" [{tag}]" if tag in ("urgent", "important") else ""
+                    lines.append(f"- {item['formatted']}{tag_label}")
             else:
                 lines.append("")
-                lines.append("Nothing looks especially urgent from the subject lines and snippets.")
-                lines.append("Recent messages:")
-                for item in emails[:5]:
-                    lines.append(f"- {item['formatted']}")
+                # Grade all emails and show urgent/important ones first
+                tagged = grader.grade_batch(emails[:10])
+                urgent_or_important = [(it, t) for it, t in tagged if t in ("urgent", "important")]
+                if urgent_or_important:
+                    lines.append("Needs attention:")
+                    for item, tag in urgent_or_important:
+                        lines.append(f"- [{tag}] {item['formatted']}")
+                    lines.append("")
+                    lines.append("Other recent:")
+                    for item, tag in tagged:
+                        if tag not in ("urgent", "important"):
+                            lines.append(f"- {item['formatted']}")
+                else:
+                    lines.append("Nothing looks especially urgent from the subject lines and snippets.")
+                    lines.append("Recent messages:")
+                    for item, _ in tagged[:5]:
+                        lines.append(f"- {item['formatted']}")
             response = "\n".join(lines)
 
         if warnings:
@@ -290,6 +502,73 @@ class PepperCore:
         if asks_owner_identity:
             return f"You are {owner_name}."
         return "I'm Pepper, your AI life assistant."
+
+    def _format_clarification(self, routing) -> str:
+        """Phase 6.7: Build a deterministic clarifying question from a routing
+        decision marked needs_clarification.
+
+        Chooses the most helpful form based on why clarification is needed:
+          - Every candidate source unavailable → name the sources + their status
+            so the user sees exactly what's blocked.
+          - Multiple plausible sources but no clear pick → list the options.
+          - No specific source at all → ask which channel they meant.
+        """
+        from agent.capability_registry import CapabilityStatus
+
+        sources = [s for s in routing.target_sources if s not in ("all", "unknown")]
+        reg = self._capability_registry
+
+        # Case A: sources named but none reachable.
+        if sources:
+            statuses = []
+            all_unavailable = True
+            for src in sources:
+                cap = reg.get(src) or next(
+                    (reg.get(k) for k in self._resolve_aliases(src) if reg.get(k)),
+                    None,
+                )
+                if cap:
+                    phrase = self._status_phrase(cap.status)
+                    statuses.append(f"{cap.display_name} is {phrase}")
+                    if cap.status == CapabilityStatus.AVAILABLE:
+                        all_unavailable = False
+                else:
+                    statuses.append(src)
+                    all_unavailable = False
+
+            if all_unavailable and statuses:
+                joined = "; ".join(statuses)
+                return (
+                    f"I can't reach any of the sources your question touches — {joined}. "
+                    "Want me to try a different channel or wait until that's sorted?"
+                )
+            if len(sources) > 1:
+                return (
+                    "That could mean a few different places — "
+                    f"{', '.join(sources)}. Which one do you want me to check?"
+                )
+
+        # Case B: no named source at all.
+        return (
+            "Which channel do you want me to check — email, iMessage, "
+            "WhatsApp, Slack, or calendar?"
+        )
+
+    @staticmethod
+    def _resolve_aliases(source_hint: str) -> list[str]:
+        from agent.capability_registry import SOURCE_ALIASES
+        return SOURCE_ALIASES.get(source_hint.lower(), [source_hint])
+
+    @staticmethod
+    def _status_phrase(status) -> str:
+        from agent.capability_registry import CapabilityStatus
+        return {
+            CapabilityStatus.AVAILABLE: "available",
+            CapabilityStatus.NOT_CONFIGURED: "not configured",
+            CapabilityStatus.PERMISSION_REQUIRED: "missing a permission grant",
+            CapabilityStatus.TEMPORARILY_UNAVAILABLE: "temporarily unavailable",
+            CapabilityStatus.DISABLED: "disabled",
+        }.get(status, str(status))
 
     def _answer_capability_check(self, user_message: str, routing) -> str | None:
         """Return a registry-grounded answer for capability-check queries.
@@ -559,15 +838,57 @@ class PepperCore:
         # The routing decision is logged for eval tracking and is used below to:
         #   - Short-circuit capability-check queries with a registry answer
         #   - Tag entity targets for person-centric lookups (future use)
-        routing = self._router.route(user_message, self._capability_registry)
-        chat_logger.info(
-            "routing_decision",
-            intent=routing.intent_type.value,
-            sources=routing.target_sources,
-            action_mode=routing.action_mode.value,
-            time_scope=routing.time_scope,
-            entity_targets=routing.entity_targets,
+        #
+        # Phase 6.5: pass recent user turns so "anything urgent?" after an email
+        # question inherits email context; registry filters unreachable sources.
+        recent_for_router: list[str] = []
+        if not isolated:
+            recent_for_router = [
+                m["content"] for m in self.memory.get_working_memory(limit=6)
+                if m.get("role") == "user"
+            ][-3:-1]
+        # Phase 6.5: use route_multi so compound queries like "any emails and
+        # what's on my calendar?" are split into independent routing decisions.
+        # Each sub-intent goes through capability filtering; clarification fires
+        # if any sub-intent is blocked. The primary decision (highest confidence)
+        # is used for the existing single-decision code paths below.
+        all_routings = self._router.route_multi(
+            user_message, self._capability_registry, recent_for_router
         )
+        routing = max(all_routings, key=lambda r: r.confidence)
+        for r in all_routings:
+            chat_logger.info(
+                "routing_decision",
+                intent=r.intent_type.value,
+                sources=r.target_sources,
+                action_mode=r.action_mode.value,
+                time_scope=r.time_scope,
+                entity_targets=r.entity_targets,
+                confidence=r.confidence,
+                n_intents=len(all_routings),
+            )
+
+        # Phase 6.7: clarifying-question path. If ANY routing leg needs
+        # clarification (e.g. registry filtered every candidate source),
+        # emit a precise deterministic question rather than guessing.
+        blocked = [r for r in all_routings if r.needs_clarification]
+        if blocked and not isolated:
+            clarifier = self._format_clarification(blocked[0])
+            if clarifier:
+                self.memory.add_to_working_memory("assistant", clarifier)
+                chat_logger.info(
+                    "clarification_short_circuit",
+                    reasoning=blocked[0].reasoning,
+                    sources=blocked[0].target_sources,
+                )
+                chat_logger.info("chat_out", text=clarifier[:1000])
+                await self._save_conversation(session_id, user_message, clarifier)
+                chat_logger.info(
+                    "chat_complete",
+                    path="clarification",
+                    duration_ms=round((time.perf_counter() - started_at) * 1000),
+                )
+                return clarifier
 
         # Phase 6.3: answer capability-check queries directly from the registry.
         # This prevents the model from guessing ("I think I can read email…") and
@@ -674,7 +995,9 @@ class PepperCore:
             if "error" in result:
                 response_text = f"I couldn't scan your WhatsApp chats: {result['error']}"
             else:
-                response_text = result["summary"]
+                response_text = self._apply_priority_tags_to_attention(
+                    result, source_label="WhatsApp"
+                )
             if not isolated:
                 self.memory.add_to_working_memory("assistant", response_text)
             chat_logger.info("chat_out", text=response_text[:1000])
@@ -699,7 +1022,9 @@ class PepperCore:
             if "error" in result:
                 response_text = f"I couldn't scan your iMessages: {result['error']}"
             else:
-                response_text = result["summary"]
+                response_text = self._apply_priority_tags_to_attention(
+                    result, source_label="iMessage"
+                )
             if not isolated:
                 self.memory.add_to_working_memory("assistant", response_text)
             chat_logger.info("chat_out", text=response_text[:1000])
@@ -711,6 +1036,23 @@ class PepperCore:
                 duration_ms=round((time.perf_counter() - started_at) * 1000),
             )
             return response_text
+
+        if heavy:
+            routed_summary = await self._maybe_build_priority_routed_summary(
+                user_message, all_routings
+            )
+            if routed_summary:
+                if not isolated:
+                    self.memory.add_to_working_memory("assistant", routed_summary)
+                chat_logger.info("chat_out", text=routed_summary[:1000])
+                if not isolated:
+                    await self._save_conversation(session_id, user_message, routed_summary)
+                chat_logger.info(
+                    "chat_complete",
+                    path="priority_routed_summary",
+                    duration_ms=round((time.perf_counter() - started_at) * 1000),
+                )
+                return routed_summary
 
         if heavy:
             # For follow-up questions ("what's the second priority?") the
@@ -958,7 +1300,7 @@ class PepperCore:
             chat_logger.info("context_compression_complete", n_messages=len(messages))
 
         # Native tools run in-process; MCP tools route via the tool router.
-        tools = MEMORY_TOOLS + CALENDAR_TOOLS + EMAIL_TOOLS + IMESSAGE_TOOLS + WHATSAPP_TOOLS + SLACK_TOOLS + CONTACT_TOOLS + COMMS_HEALTH_TOOLS + IMAGE_TOOLS
+        tools = MEMORY_TOOLS + CALENDAR_TOOLS + EMAIL_TOOLS + IMESSAGE_TOOLS + WHATSAPP_TOOLS + SLACK_TOOLS + CONTACT_TOOLS + COMMS_HEALTH_TOOLS + IMAGE_TOOLS + _PENDING_ACTION_TOOLS
         # Phase 5: append MCP tools discovered from external servers
         mcp_tools = self.tool_router.get_mcp_tools()
         if mcp_tools:
@@ -1315,8 +1657,20 @@ class PepperCore:
             ),
         }
 
-    async def _execute_tool(self, name: str, args: dict, session_id: str = "") -> dict:
-        """Route tool call to memory tools, subsystem, or MCP server."""
+    async def _execute_tool(
+        self,
+        name: str,
+        args: dict,
+        session_id: str = "",
+        skip_mcp_write_gate: bool = False,
+    ) -> dict:
+        """Route tool call to memory tools, subsystem, or MCP server.
+
+        skip_mcp_write_gate: bypasses the per-session MCP write approval gate.
+            Only set by callers that already run their own approval flow
+            (currently just PendingActionsQueue). Normal chat turns must leave
+            this False.
+        """
         started_at = time.perf_counter()
         logger.info("tool_call_started", name=name, args=args)
 
@@ -1327,7 +1681,7 @@ class PepperCore:
                 # Read-only tools (readOnlyHint=True) bypass this gate.
                 # The gate fires even when allow_side_effects is enabled so that
                 # an opted-in server still requires explicit per-action user consent.
-                if not self.tool_router.is_mcp_read_only_tool(name):
+                if not skip_mcp_write_gate and not self.tool_router.is_mcp_read_only_tool(name):
                     gate = self._check_mcp_write_gate(session_id, name, args)
                     if gate is not None:
                         return gate
@@ -1342,7 +1696,28 @@ class PepperCore:
                 )
                 return result
 
-            if name == "save_memory":
+            if name == "queue_outbound_action":
+                # Phase 6.7: model calls this when it has a draft action ready
+                # (e.g. a reply to send). Enqueues it for async user approval via
+                # the web UI rather than executing immediately.
+                tool_name = args.get("tool_name", "")
+                tool_args = args.get("args", {})
+                preview = args.get("preview", "")
+                if not tool_name:
+                    result = {"error": "queue_outbound_action requires 'tool_name'"}
+                else:
+                    action = self.pending_actions.queue(tool_name, tool_args, preview)
+                    result = {
+                        "ok": True,
+                        "queued": True,
+                        "action_id": action.id,
+                        "message": (
+                            "Draft queued for your review. You can approve, edit, or reject it "
+                            "from the Pepper status panel."
+                        ),
+                    }
+
+            elif name == "save_memory":
                 await self.memory.save_to_recall(
                     args.get("content", ""), args.get("importance", 0.5)
                 )
@@ -1483,6 +1858,17 @@ class PepperCore:
                 duration_ms=round((time.perf_counter() - started_at) * 1000),
                 result=self._summarize_tool_result(result),
             )
+            # Phase 6.6: runtime registry refresh on tool error. Any tool that
+            # returns {"error": "..."} is classified (permission/auth/transient)
+            # and the matching source is updated so the next turn's prompt and
+            # router reflect the new reality.
+            if isinstance(result, dict) and "error" in result:
+                try:
+                    self._capability_registry.classify_tool_error(
+                        name, str(result.get("error", ""))
+                    )
+                except Exception:
+                    pass
             return result
         except Exception as exc:
             logger.error(
@@ -1491,6 +1877,10 @@ class PepperCore:
                 error=str(exc),
                 duration_ms=round((time.perf_counter() - started_at) * 1000),
             )
+            try:
+                self._capability_registry.classify_tool_error(name, str(exc))
+            except Exception:
+                pass
             raise
 
     async def _reload_session_history(self, session_id: str) -> None:

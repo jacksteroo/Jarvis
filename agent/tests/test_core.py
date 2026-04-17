@@ -386,6 +386,94 @@ async def test_pepper_core_summarize_text_messages_bypasses_llm():
         mock_llm.chat.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_pepper_core_cross_source_triage_uses_priority_summary_bypass():
+    """Cross-source triage should build a deterministic priority-tagged summary."""
+    from agent.core import PepperCore
+    from agent.priority_grader import PriorityGrader
+
+    config = make_mock_config()
+
+    with patch("agent.core.ModelClient") as MockLLM, \
+         patch("agent.core.MemoryManager") as MockMem, \
+         patch("agent.core.ToolRouter") as MockRouter, \
+         patch("agent.core.build_system_prompt", return_value="system"), \
+         patch("agent.core.CommitmentExtractor") as MockExtractor, \
+         patch(
+             "agent.core.execute_get_email_summary",
+             new=AsyncMock(return_value={
+                 "important": [
+                     {
+                         "from": "boss@acme.com",
+                         "subject": "ASAP: review this",
+                         "formatted": "[Work] ASAP: review this [UNREAD] — from Boss.",
+                     }
+                 ],
+                 "emails": [
+                     {
+                         "from": "boss@acme.com",
+                         "subject": "ASAP: review this",
+                         "formatted": "[Work] ASAP: review this [UNREAD] — from Boss.",
+                     }
+                 ],
+                 "hours": 24,
+             }),
+         ), \
+         patch(
+             "agent.core.execute_get_recent_imessage_attention",
+             new=AsyncMock(return_value={
+                 "items": [
+                     {
+                         "display_name": "Sarah",
+                         "sender": "Sarah",
+                         "text": "Dinner tonight?",
+                         "unread_count": 1,
+                     }
+                 ],
+                 "summary": "fallback imessage summary",
+             }),
+         ), \
+         patch(
+             "agent.core.execute_get_recent_whatsapp_attention",
+             new=AsyncMock(return_value={
+                 "items": [],
+                 "summary": "fallback whatsapp summary",
+             }),
+         ):
+
+        mock_llm = make_mock_llm()
+        MockLLM.return_value = mock_llm
+
+        mock_memory = MagicMock()
+        mock_memory.add_to_working_memory = MagicMock()
+        mock_memory.get_working_memory = MagicMock(return_value=[])
+        MockMem.return_value = mock_memory
+
+        MockRouter.return_value.check_health = AsyncMock(return_value={})
+        MockRouter.return_value.list_available_tools = AsyncMock(return_value=[])
+        MockRouter.return_value.get_status.return_value = {}
+
+        MockExtractor.return_value.has_commitment_language = MagicMock(return_value=False)
+
+        pepper = PepperCore(config)
+        pepper._initialized = True
+        pepper._system_prompt = "system"
+        pepper._make_grader = lambda: PriorityGrader(vips=["sarah"])
+
+        response = await pepper.chat(
+            "What needs my attention right now?",
+            "test-session",
+            heavy=True,
+        )
+
+        assert "Here’s what looks most important across your inbox and messages" in response
+        assert "[urgent]" in response
+        assert "[important]" in response
+        assert "Email:" in response
+        assert "iMessage:" in response
+        mock_llm.chat.assert_not_called()
+
+
 def test_config_model_routing():
     """select_model routes raw_personal data to local model always."""
     from agent.config import Settings
@@ -530,3 +618,76 @@ class TestMCPApprovalRegex:
         ]
         for msg in non_approvals:
             assert not _MCP_WRITE_APPROVAL_RE.match(msg), f"Should NOT match: {msg!r}"
+
+
+# ── Pending-actions queue → MCP write end-to-end ──────────────────────────────
+
+
+class TestPendingActionsMCPExecution:
+    """Integration: queue_outbound_action → approve → MCP write actually runs.
+
+    Regression guard for the bug where _check_mcp_write_gate intercepted the
+    pending-actions executor path and the queue misclassified
+    ``approval_required`` responses as success.
+    """
+
+    @pytest.mark.asyncio
+    async def test_approved_pending_calls_mcp_tool_without_gate_block(self):
+        pepper = _make_pepper_for_gate()
+        # Route the MCP tool call through a stub so we can assert it fires.
+        pepper.tool_router.is_mcp_tool = MagicMock(return_value=True)
+        pepper.tool_router.is_mcp_read_only_tool = MagicMock(return_value=False)
+        pepper.tool_router.call_mcp_tool = AsyncMock(return_value={"ok": True, "id": "msg_1"})
+
+        # Sanity: verify a normal chat-turn call to this MCP write tool WOULD
+        # still be gated. This ensures we're not globally disabling the gate.
+        gate = pepper._check_mcp_write_gate("sess1", "mcp_slack_post_message", {"channel": "#x", "text": "hi"})
+        assert gate is not None and gate.get("approval_required")
+        # Clear the side-effect of that sanity check.
+        pepper._pending_mcp_writes.pop("sess1", None)
+
+        # Queue via the normal path, then approve.
+        action = pepper.pending_actions.queue(
+            "mcp_slack_post_message",
+            {"channel": "#general", "text": "status update"},
+            preview="adversarial benign-looking summary",
+        )
+        result = await pepper.pending_actions.approve(action.id)
+
+        assert result is not None
+        assert result.status == "executed", (
+            f"queued MCP write should execute on approval, got {result.status}: {result.result}"
+        )
+        pepper.tool_router.call_mcp_tool.assert_awaited_once_with(
+            "mcp_slack_post_message", {"channel": "#general", "text": "status update"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_approval_required_response_is_treated_as_failed(self):
+        """Defense in depth: if a future executor returns approval_required,
+        the queue must NOT mark the item executed."""
+        from agent.pending_actions import PendingActionsQueue
+        queue = PendingActionsQueue()
+        queue.set_executor(AsyncMock(return_value={
+            "approval_required": True,
+            "message": "blocked by gate",
+        }))
+        action = queue.queue("send_email", {"to": "a@b.com", "body": "x"})
+        result = await queue.approve(action.id)
+        assert result.status == "failed"
+        assert "error" in result.result
+
+    def test_queue_preview_is_server_derived_not_model_controlled(self):
+        """Model-supplied preview must not be the authoritative display string."""
+        from agent.pending_actions import PendingActionsQueue
+        queue = PendingActionsQueue()
+        action = queue.queue(
+            "send_email",
+            {"to": "victim@example.com", "body": "real payload"},
+            preview="innocent-looking summary the model supplied",
+        )
+        # Server-derived preview reflects the real recipient and body.
+        assert "victim@example.com" in action.preview
+        assert "real payload" in action.preview
+        # Model-supplied string is preserved as advisory only.
+        assert action.model_description == "innocent-looking summary the model supplied"

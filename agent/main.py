@@ -328,3 +328,62 @@ async def get_capabilities():
         "capabilities": report,
         "available": p._capability_registry.get_available_sources(),
     }
+
+
+@app.post("/capabilities/refresh", dependencies=[Depends(require_api_key)])
+async def refresh_capabilities():
+    """Phase 6.6: force a re-probe of all source statuses."""
+    p = _get_pepper()
+    if not p:
+        raise HTTPException(status_code=503, detail="Pepper not initialized")
+    await p._capability_registry.refresh(settings)
+    return {
+        "ok": True,
+        "capabilities": p._capability_registry.get_full_report(),
+        "available": p._capability_registry.get_available_sources(),
+    }
+
+
+@app.get("/pending-actions", dependencies=[Depends(require_api_key)])
+async def get_pending_actions():
+    """Phase 6.7: Pending draft-and-queue outbound actions awaiting approval."""
+    p = _get_pepper()
+    if not p:
+        return {"pending": [], "count": 0}
+    items = p.pending_actions.list_pending()
+    return {"pending": items, "count": len(items)}
+
+
+class PendingActionDecision(BaseModel):
+    action: str  # "approve" | "reject" | "edit"
+    edited_body: str | None = None
+
+
+@app.post("/pending-actions/{action_id}", dependencies=[Depends(require_api_key)])
+async def act_on_pending(action_id: str, req: PendingActionDecision):
+    """Phase 6.7: approve, reject, or edit a queued outbound action."""
+    p = _get_pepper()
+    if not p:
+        raise HTTPException(status_code=503, detail="Pepper not initialized")
+    if req.action == "approve":
+        result = await p.pending_actions.approve(action_id)
+        if not result:
+            raise HTTPException(status_code=404, detail="Pending action not found")
+        if result.status == "failed":
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "Action execution failed", "result": result.result},
+            )
+    elif req.action == "reject":
+        result = p.pending_actions.reject(action_id)
+        if not result:
+            raise HTTPException(status_code=404, detail="Pending action not found")
+    elif req.action == "edit":
+        if req.edited_body is None:
+            raise HTTPException(status_code=400, detail="edited_body required for edit")
+        result = p.pending_actions.edit(action_id, req.edited_body)
+        if not result:
+            raise HTTPException(status_code=404, detail="Pending action not found")
+    else:
+        raise HTTPException(status_code=400, detail="action must be approve|reject|edit")
+    return {"ok": True, "id": action_id, "action": req.action, "status": result.status}
