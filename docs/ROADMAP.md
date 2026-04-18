@@ -845,7 +845,7 @@ This is the largest of the three extension subphases and the one with the most u
 With runtime, skills, and MCP in place, the wishlist items become dramatically cheaper to build:
 
 - **Knowledge layer** → most items become MCP server integrations (Obsidian MCP, filesystem MCP) + skills
-- **Health & Finance** → CSV/export parsing becomes a skill; health sources (Apple Health, Oura Ring, Garmin, Whoop, etc.) each become a local MCP server
+- **Health & Finance** → CSV/export parsing becomes a skill; a single Health MCP server handles all sources (Apple Health, Oura Ring, Garmin, Whoop, etc.) via per-source adapters
 - **Pre-event intelligence / deadline awareness** → already listed as planned skills in 4.4
 - **Maintenance & Security** → scheduled skills running on the background scheduler; the Phase 3.3 error classifier is the foundation
 

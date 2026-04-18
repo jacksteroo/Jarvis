@@ -26,6 +26,8 @@ Relationship intelligence is useful, but the exact capabilities Pepper needs sho
 
 ### Integration interface (when ready)
 
+Tool names below are illustrative — the actual interface will be driven by what Pepper needs from real usage.
+
 ```text
 GET  /tools                          # Available people tools
 POST /tools/get_contact_details      # Person profile
@@ -213,9 +215,9 @@ Reads health data from multiple sources and gives Pepper awareness of your physi
 
 ### Privacy
 
-- All health data stays on the machine
-- Raw metrics stored locally; Pepper receives summaries
-- No integration with any health API — export-only
+- All health data stays on the machine — raw metrics are never transmitted
+- Raw metrics stored locally; Pepper receives summaries only
+- API access (e.g. Oura Ring API) is acceptable where the API key lives locally and data flows machine → source → machine; no health data is sent to third-party cloud services
 
 ### What Pepper does with this
 
