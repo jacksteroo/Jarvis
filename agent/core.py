@@ -1539,6 +1539,11 @@ class PepperCore:
             "what's confirmed", "what is confirmed",
             "what's missing", "what is missing",
             "confirmed and", "what do i still", "what do we still",
+            # Application / research status queries — prevent hallucination
+            "did we apply", "did i apply", "have we applied", "have i applied",
+            "applied to", "which programs", "which schools", "which colleges",
+            "which pre-college", "what programs", "what schools",
+            "what did we apply", "what did i apply",
         )
         if (
             routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT
@@ -1569,6 +1574,30 @@ class PepperCore:
                 ]
                 if _section_blocks:
                     _injected = "\n\n".join(_section_blocks)
+
+                    # Deterministically extract ⚠️ conflict lines that share
+                    # keywords with the user's question so the model cannot miss them.
+                    import re as _re
+                    _topic_words = set(
+                        _re.findall(r"\b\w{4,}\b", user_message.lower())
+                    )
+                    _conflict_lines = [
+                        ln.strip()
+                        for ln in _injected.splitlines()
+                        if "⚠️" in ln and (
+                            _topic_words & set(_re.findall(r"\b\w{4,}\b", ln.lower()))
+                        )
+                    ]
+                    if _conflict_lines:
+                        _conflict_preamble = (
+                            "[⚠️ DATE/SCHEDULE CONFLICT(S) affecting this item "
+                            "— mention these FIRST before anything else:\n"
+                            + "\n".join(_conflict_lines)
+                            + "\n]\n\n"
+                        )
+                    else:
+                        _conflict_preamble = ""
+
                     messages[-1] = {
                         "role": "user",
                         "content": (
@@ -1576,12 +1605,11 @@ class PepperCore:
                             "Quote ONLY the facts directly relevant to the specific topic named in the question. "
                             "If the question names a specific trip, event, or item (e.g. Orlando, Boston, Uber Teen), "
                             "answer only about that item — do NOT list other unrelated open loops or pending items. "
-                            "EXCEPTION: if the life context contains a ⚠️ date conflict, schedule conflict, or overlap "
-                            "directly associated with the named item, you MUST include it — even if it mentions another trip or location. "
                             "CRITICAL: If the question asks 'is X sorted/done/confirmed/set up?' and X appears in the "
                             "Open Loops section below, the answer MUST start with 'Not yet' or 'No' — "
                             "open loops are unresolved by definition. State what still needs to happen. "
                             "Do NOT add details from your training knowledge or prior conversations.]\n"
+                            + _conflict_preamble
                             + _injected
                             + "\n\n[Question:]\n"
                             + messages[-1]["content"]
