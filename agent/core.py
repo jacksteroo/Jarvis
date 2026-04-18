@@ -646,11 +646,16 @@ class PepperCore:
             lines = [f"I found {len(emails)} email(s) in {scope_text} from the last {hours} hours."]
             if important:
                 lines.append("")
-                lines.append("Most important:")
+                shown: list[str] = []
                 for item in important:
                     tag = grader.grade(item)
+                    if tag == "ignore":
+                        continue
                     tag_label = f" [{tag}]" if tag in ("urgent", "important") else ""
-                    lines.append(f"- {item['formatted']}{tag_label}")
+                    shown.append(f"- {item['formatted']}{tag_label}")
+                if shown:
+                    lines.append("Most important:")
+                    lines.extend(shown)
             else:
                 lines.append("")
                 # Grade all emails and show urgent/important ones first
