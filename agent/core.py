@@ -1453,7 +1453,13 @@ class PepperCore:
                 "DIRECTLY from the Open Loops and Active Challenges sections of "
                 "your life context. Do NOT call get_upcoming_events, "
                 "get_calendar_events_range, get_driving_time, or any other tool "
-                "for these questions — the answer is in your life context."
+                "for these questions — the answer is in your life context.\n"
+                "10. Items listed in 'Open Loops Taking Up Mental Space' or "
+                "'Active Challenges' are explicitly NOT resolved. If asked "
+                "'is X sorted/done/confirmed?' and X appears as an open loop, "
+                "the answer is NO — still outstanding. NEVER describe an open "
+                "loop item as completed, done, or set up. Report it as still "
+                "pending and state what action is needed."
             )
             await _progress("Synthesizing response...")
 
@@ -1529,6 +1535,10 @@ class PepperCore:
             "confirmed yet", "booked yet", "is it booked", "been sorted",
             "unconfirmed", "still unconfirmed", "not confirmed",
             "what's still", "what is still", "still needs to be",
+            "what's the situation", "what is the situation",
+            "what's confirmed", "what is confirmed",
+            "what's missing", "what is missing",
+            "confirmed and", "what do i still", "what do we still",
         )
         if (
             routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT
@@ -1543,8 +1553,17 @@ class PepperCore:
                     "Active Challenges",
                     "Open Loops Taking Up Mental Space",
                 )
+                _open_loop_note = (
+                    "[NOTE: Every item listed in this section is UNRESOLVED — "
+                    "NOT done, NOT sorted, NOT set up. Each requires action. "
+                    "If asked 'is X sorted/done/confirmed?', answer NO.]\n"
+                )
                 _section_blocks = [
-                    f"## {h}\n{_lc_sections[h]}"
+                    (
+                        f"## {h}\n{_open_loop_note}{_lc_sections[h]}"
+                        if h == "Open Loops Taking Up Mental Space"
+                        else f"## {h}\n{_lc_sections[h]}"
+                    )
                     for h in _relevant_headings
                     if _lc_sections.get(h)
                 ]
@@ -1557,6 +1576,11 @@ class PepperCore:
                             "Quote ONLY the facts directly relevant to the specific topic named in the question. "
                             "If the question names a specific trip, event, or item (e.g. Orlando, Boston, Uber Teen), "
                             "answer only about that item — do NOT list other unrelated open loops or pending items. "
+                            "EXCEPTION: if the life context contains a ⚠️ date conflict, schedule conflict, or overlap "
+                            "directly associated with the named item, you MUST include it — even if it mentions another trip or location. "
+                            "CRITICAL: If the question asks 'is X sorted/done/confirmed/set up?' and X appears in the "
+                            "Open Loops section below, the answer MUST start with 'Not yet' or 'No' — "
+                            "open loops are unresolved by definition. State what still needs to happen. "
                             "Do NOT add details from your training knowledge or prior conversations.]\n"
                             + _injected
                             + "\n\n[Question:]\n"
@@ -1566,6 +1590,43 @@ class PepperCore:
                     chat_logger.debug(
                         "life_context_status_facts_injected",
                         sections=list(_lc_sections.keys()),
+                        message_preview=user_message[:80],
+                    )
+
+        # Meal-planning context injection: when query is about cooking or dinner,
+        # inject meal preferences directly adjacent to the question so the model
+        # applies them rather than falling back to generic recipe training.
+        _MEAL_QUERY_TERMS = (
+            "dinner", "lunch", "breakfast", "what should i make", "what to make",
+            "what to cook", "what should i cook", "meal", "recipe", "cooking",
+            "i have chicken", "i have beef", "i have fish", "i have pork",
+            "i have salmon", "i have tofu", "i have rice", "i have pasta",
+        )
+        if (
+            routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT
+            and messages
+            and messages[-1].get("role") == "user"
+            and not any(t in _last_content for t in _STATUS_QUERY_TERMS)
+        ):
+            _meal_content = messages[-1]["content"].lower()
+            if any(t in _meal_content for t in _MEAL_QUERY_TERMS):
+                _lc_sections = get_life_context_sections(self.config.LIFE_CONTEXT_PATH)
+                _meal_section = _lc_sections.get("Meal Planning and Cooking", "")
+                if _meal_section:
+                    messages[-1] = {
+                        "role": "user",
+                        "content": (
+                            "[Meal planning preferences — follow these exactly when answering the cooking question below:\n"
+                            + _meal_section
+                            + "\nAdditional rules: suggest 2-3 options (not a full recipe), "
+                            "include one Asian-style option if possible, add prep-ahead or "
+                            "freezer notes, build around ingredients already mentioned, "
+                            "keep the response short.]\n\n"
+                            + messages[-1]["content"]
+                        ),
+                    }
+                    chat_logger.debug(
+                        "meal_context_injected",
                         message_preview=user_message[:80],
                     )
 
