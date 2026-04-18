@@ -2284,11 +2284,14 @@ class PepperCore:
 
         Called once per session after a restart so conversation context survives
         process bounces. Does nothing if the DB is unavailable or the session is new.
+        Clears working memory first to prevent cross-session context contamination.
         """
         if not self.db_factory:
             return
         try:
             reload_started = time.perf_counter()
+            # Clear any prior session's context before loading this session's history.
+            self.memory.clear_working_memory()
             from sqlalchemy import select
             from agent.models import Conversation as ConvModel
             async with self.db_factory() as db:
