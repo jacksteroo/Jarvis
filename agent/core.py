@@ -1301,7 +1301,7 @@ class PepperCore:
 
             fetch_results = await asyncio.gather(
                 self.memory.build_context_for_query(user_message),
-                self._maybe_search_web(user_message),
+                self._maybe_search_web(user_message, skip=routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT),
                 self._maybe_get_driving_time(user_message),
                 maybe_get_calendar_context(trigger_text),
                 maybe_get_email_context(trigger_text),
@@ -1512,6 +1512,8 @@ class PepperCore:
             "what's the status", "what is the status",
             "sorted?", " sorted", "been booked", "been confirmed",
             "confirmed yet", "booked yet", "is it booked", "been sorted",
+            "unconfirmed", "still unconfirmed", "not confirmed",
+            "what's still", "what is still", "still needs to be",
         )
         if (
             routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT
@@ -1537,8 +1539,10 @@ class PepperCore:
                         "role": "user",
                         "content": (
                             "[Life context facts — use these to answer the question below. "
-                            "Quote the relevant facts directly. Do NOT add details "
-                            "from your training knowledge or prior conversations.]\n"
+                            "Quote ONLY the facts directly relevant to the specific topic named in the question. "
+                            "If the question names a specific trip, event, or item (e.g. Orlando, Boston, Uber Teen), "
+                            "answer only about that item — do NOT list other unrelated open loops or pending items. "
+                            "Do NOT add details from your training knowledge or prior conversations.]\n"
                             + _injected
                             + "\n\n[Question:]\n"
                             + messages[-1]["content"]
@@ -2279,8 +2283,10 @@ class PepperCore:
         "who is", "where is", "when is", "weather",
     )
 
-    async def _maybe_search_web(self, user_message: str) -> str:
+    async def _maybe_search_web(self, user_message: str, skip: bool = False) -> str:
         """Run a Brave search if the message looks search-like. Returns formatted context or ''."""
+        if skip:
+            return ""
         if not self.config.BRAVE_API_KEY:
             return ""
         lower = user_message.lower()
