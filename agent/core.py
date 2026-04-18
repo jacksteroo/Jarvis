@@ -1544,9 +1544,17 @@ class PepperCore:
             "applied to", "which programs", "which schools", "which colleges",
             "which pre-college", "what programs", "what schools",
             "what did we apply", "what did i apply",
+            # Schedule conflict / date-overlap queries — must consult life context
+            "conflict", "scheduling conflict", "schedule conflict",
+            "date conflict", "conflicts for", "conflict for",
+            "conflict i should", "overlap", "same day as",
+            # Account / setup status queries
+            "set up", "been set up", "is it set up", "is that set up",
+            "set up yet", "set up for", "been activated", "is it active",
+            "is it working", "been enabled",
         )
         if (
-            routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT
+            routing.action_mode in (ActionMode.ANSWER_FROM_CONTEXT, ActionMode.CALL_TOOLS)
             and messages
             and messages[-1].get("role") == "user"
         ):
