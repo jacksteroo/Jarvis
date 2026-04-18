@@ -18,8 +18,9 @@ tools:
   - search_emails
   - get_contact_profile
   - search_memory
+  - queue_outbound_action
 model: frontier
-version: 1
+version: 2
 ---
 
 ## Workflow
@@ -46,6 +47,14 @@ version: 1
    - Keep it concise — match the length of their typical messages
    - Present the draft clearly labeled: "Draft reply:"
 
-6. After presenting the draft, offer: "Want me to adjust the tone, length, or add anything specific?"
+6. Call `queue_outbound_action` with:
+   - `tool_name`: the appropriate send tool for the channel
+     (e.g. `mcp_imessage_send_message`, `mcp_whatsapp_send_message`, or `mcp_gmail_send_email`)
+   - `args`: the full arguments object needed to send (to/recipient, body/message, etc.)
+   - `preview`: a one-line summary like "Reply to Sarah via iMessage: <first 80 chars of draft>"
+   This enqueues the draft for your explicit approval in the Pepper status panel — nothing is sent until you approve.
+
+7. After queuing, confirm: "Draft queued for your review. You can approve, edit, or reject it from the status panel. Want me to adjust anything before you approve?"
 
 Never fabricate conversation history. Only draft based on what the tools return.
+Never send directly — always use queue_outbound_action so you keep full control.

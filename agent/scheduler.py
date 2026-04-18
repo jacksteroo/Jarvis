@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from agent.briefs import CommitmentExtractor
+from agent.commitment_followup import CommitmentFollowup
 from agent.models import AuditLog
 
 logger = structlog.get_logger()
@@ -22,6 +23,9 @@ class PepperScheduler:
         self.config = config
         self.bot = telegram_bot
         self.extractor = CommitmentExtractor(llm_client=getattr(pepper_core, 'llm', None))
+        # Persistent instance so _surfaced set accumulates across scheduler runs
+        # within the same process and prevents same-day re-nags.
+        self._commitment_followup = CommitmentFollowup(pepper_core)
         self._scheduler = AsyncIOScheduler()
         self._last_brief: datetime = None
         self._last_review: datetime = None
@@ -54,6 +58,22 @@ class PepperScheduler:
             self.run_memory_compression,
             CronTrigger(day_of_week=6, hour=2, minute=0),
             id="memory_compression",
+            replace_existing=True,
+        )
+        # Phase 6.6: periodic capability re-probe.
+        # Covers the case where a user grants Full Disk Access, configures a
+        # credential file, or installs WhatsApp Desktop without restarting Pepper.
+        self._scheduler.add_job(
+            self.refresh_capabilities,
+            CronTrigger(minute="*/15"),
+            id="capability_refresh",
+            replace_existing=True,
+        )
+        # Phase 6.7: surface unresolved commitments at the relevant time.
+        self._scheduler.add_job(
+            self.run_commitment_followup,
+            CronTrigger(hour="8,17,22", minute=5),
+            id="commitment_followup",
             replace_existing=True,
         )
         self._scheduler.start()
@@ -194,6 +214,33 @@ class PepperScheduler:
         result = await self.pepper.memory.compress_to_archival()
         await self._audit("memory_compression", str(result))
         return result
+
+    async def refresh_capabilities(self) -> dict:
+        """Phase 6.6: Re-probe all data sources so registry reflects current state."""
+        try:
+            await self.pepper._capability_registry.refresh(self.config)
+            available = self.pepper._capability_registry.get_available_sources()
+            logger.info("capability_refresh_done", available=available)
+            return {"ok": True, "available": available}
+        except Exception as e:
+            logger.warning("capability_refresh_failed", error=str(e))
+            return {"ok": False, "error": str(e)}
+
+    async def run_commitment_followup(self) -> str:
+        """Phase 6.7: surface unresolved commitments at the time they're due.
+
+        Re-surfaces commitments whose follow-up time has arrived (today/EOD/tonight
+        mapped to the scheduler's 3 daily slots). Already-resolved ones are skipped.
+        """
+        due = await self._commitment_followup.find_due_commitments()
+        if not due:
+            logger.info("commitment_followup_none_due")
+            return ""
+        message = self._commitment_followup.format_followup_message(due)
+        await self._send(message)
+        await self._audit("commitment_followup", f"{len(due)} items")
+        logger.info("commitment_followup_sent", count=len(due))
+        return message
 
     def get_status(self) -> dict:
         return {
