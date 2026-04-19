@@ -342,9 +342,24 @@ class PepperCore:
             r"[^\n.!?]*\bin your life context\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bin the life context\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bfrom the life context\b[^\n.!?]*[.!?]?",
+            # Strip full sentences that are pure meta-commentary / interpretation
+            r"[^\n.!?]*\bThe life context does not (?:specify|mention|include|list|contain|state|indicate)\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bIt seems that\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bit seems that\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bIt appears that\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bit appears that\b[^\n.!?]*[.!?]?",
         ]
         for pat in _meta_patterns:
             text = re.sub(pat, "", text, flags=re.IGNORECASE)
+        # Replace impersonal "it is advised/recommended to X" constructions with
+        # direct imperative equivalents so the response sounds like an EA, not a report.
+        _impersonal_replacements = [
+            (r"[Ii]t is (?:advised|recommended|suggested) to plan accordingly", "Plan accordingly"),
+            (r"[Ii]t is (?:advised|recommended|suggested) to", ""),
+            (r"\band it is (?:advised|recommended|suggested) to\b", "and"),
+        ]
+        for pat, repl in _impersonal_replacements:
+            text = re.sub(pat, repl, text, flags=re.IGNORECASE)
         # Remove consecutive duplicate sentences that Hermes3 sometimes emits
         # when conversation history contains a prior response to the same question.
         sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -798,6 +813,14 @@ class PepperCore:
                     ln.strip() for ln in open_loops_text.splitlines()
                     if ln.strip().startswith("-")
                 ][:4]
+                # For family-logistics queries, exclude purely financial/non-family open
+                # loops so the response stays focused on household and family items.
+                if _family_logistics_early:
+                    _non_family_kw = ("crypto", "portfolio", "bitcoin", "ethereum")
+                    loop_lines = [
+                        ln for ln in loop_lines
+                        if not any(kw in ln.lower() for kw in _non_family_kw)
+                    ]
                 if loop_lines:
                     sections.append("Open loops:\n" + "\n".join(loop_lines))
             # For queries specifically about family logistics, also surface the
@@ -827,6 +850,23 @@ class PepperCore:
                         _past_deadline_re.sub("deadline window has passed", ln)
                         for ln in raw_kids_lines
                     ]
+                    # When a 30-day window is requested, filter out kids items that
+                    # mention months beyond the cutoff so the response only covers
+                    # what's actually coming up in the specified window.
+                    if _thirty_day_window:
+                        from datetime import datetime, timedelta
+                        _now = datetime.now()
+                        _cutoff = _now + timedelta(days=30)
+                        _all_months = [
+                            "january", "february", "march", "april", "may", "june",
+                            "july", "august", "september", "october", "november", "december",
+                        ]
+                        # Months strictly after the cutoff month (same or next year)
+                        _beyond_months = _all_months[_cutoff.month:]  # 0-indexed, so month N = index N
+                        kids_lines = [
+                            ln for ln in kids_lines
+                            if not any(m in ln.lower() for m in _beyond_months)
+                        ]
                     if kids_lines:
                         sections.append(
                             "Upcoming family / kids items:\n" + "\n".join(kids_lines)
