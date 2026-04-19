@@ -818,6 +818,7 @@ class PepperCore:
                 ))
                 _routine_patterns = (
                     "workout", "stretching", "bedtime", "links", "sleep", "wake up",
+                    "practice",
                 )
                 # For family-logistics queries, also filter blocking/work-meeting noise
                 # and Jack's personal sports/hobby appointments (not family activities).
@@ -829,25 +830,26 @@ class PepperCore:
                     "badminton", "pickleball", "golf", "chess",
                 ) if _family_logistics_early else ()
                 cal_events_raw = cal_result["events"][:20]
-                if _risk_query or _family_logistics_early:
-                    cal_events_raw = [
-                        e for e in cal_events_raw
-                        if not any(
-                            p in (e.splitlines()[0] if isinstance(e, str) else str(e)).lower()
-                            for p in (*_routine_patterns, *_work_patterns)
-                        )
-                    ]
-                # Deduplicate by event title (first line) for 30-day family-logistics
-                # queries so recurring work meetings don't crowd out family events.
-                if _family_logistics_early and _thirty_day_window:
-                    _seen_titles: set[str] = set()
-                    _deduped: list = []
-                    for e in cal_events_raw:
-                        _title = (e.splitlines()[0] if isinstance(e, str) else str(e)).lower()
-                        if _title not in _seen_titles:
-                            _seen_titles.add(_title)
-                            _deduped.append(e)
-                    cal_events_raw = _deduped
+                # Routine personal events (stretching, bedtime, etc.) are never
+                # useful in any triage or priority query — filter them universally.
+                # Work-meeting noise is additionally filtered for family queries.
+                cal_events_raw = [
+                    e for e in cal_events_raw
+                    if not any(
+                        p in (e.splitlines()[0] if isinstance(e, str) else str(e)).lower()
+                        for p in (*_routine_patterns, *_work_patterns)
+                    )
+                ]
+                # Deduplicate by event title — recurring events showing multiple
+                # times in the same window are never useful regardless of query type.
+                _seen_titles: set[str] = set()
+                _deduped: list = []
+                for e in cal_events_raw:
+                    _title = (e.splitlines()[0] if isinstance(e, str) else str(e)).lower()
+                    if _title not in _seen_titles:
+                        _seen_titles.add(_title)
+                        _deduped.append(e)
+                cal_events_raw = _deduped
                 cal_lines = [
                     f"- {e.splitlines()[0]}" if isinstance(e, str) else f"- {e}"
                     for e in cal_events_raw[:10]
@@ -869,7 +871,7 @@ class PepperCore:
             if open_loops_text:
                 loop_lines = [
                     ln.strip() for ln in open_loops_text.splitlines()
-                    if ln.strip().startswith("-")
+                    if ln.strip().startswith("- ")
                 ][:4]
                 # For family-logistics queries, exclude purely financial/non-family open
                 # loops so the response stays focused on household and family items.
@@ -902,7 +904,7 @@ class PepperCore:
                     )
                     raw_kids_lines = [
                         ln.strip() for ln in kids_text.splitlines()
-                        if ln.strip().startswith("-") or ln.strip().startswith("**")
+                        if ln.strip().startswith("- ") or ln.strip().startswith("**")
                     ][:6]
                     kids_lines = [
                         _past_deadline_re.sub("deadline window has passed", ln)
@@ -2098,11 +2100,21 @@ class PepperCore:
                     )
                     return filtered if filtered.strip() else content
 
+                _PAST_DEADLINE_PAT = re.compile(
+                    r'some\s+(?:January|February|March)\s+20\d\d\s+deadlines\s+were\s+imminent',
+                    re.IGNORECASE,
+                )
+                def _sanitize_section(content: str) -> str:
+                    return _PAST_DEADLINE_PAT.sub(
+                        "deadline window has passed — confirm current application status",
+                        content,
+                    )
+
                 _section_blocks = [
                     (
-                        f"## {h}\n{_open_loop_note}{_maybe_filter_open_loops(h, _lc_sections[h])}"
+                        f"## {h}\n{_open_loop_note}{_maybe_filter_open_loops(h, _sanitize_section(_lc_sections[h]))}"
                         if h == "Open Loops Taking Up Mental Space"
-                        else f"## {h}\n{_lc_sections[h]}"
+                        else f"## {h}\n{_sanitize_section(_lc_sections[h])}"
                     )
                     for h in _relevant_headings
                     if _lc_sections.get(h)
@@ -2137,7 +2149,7 @@ class PepperCore:
                     # named topic so the model gets the answer directly instead
                     # of having to infer it from "confirmed" vs unconfirmed text.
                     _confirmed_words = {"confirmed", "booked", "starting june", "starting july", "starting august", "starting may", "two weeks starting", "program ends"}
-                    _pending_words = {"confirm", "check", "follow", "tbd", "unknown", "missing", "needed", "needed"}
+                    _pending_words = {"confirm", "follow", "tbd", "unknown", "missing", "needed"}
                     # Strip action verbs and classifier words from topic_words so
                     # common words like "confirm" or "left" don't produce false
                     # cross-topic matches (e.g. pre-college "confirm" ≠ Orlando item).
@@ -2164,14 +2176,25 @@ class PepperCore:
                         for ln in _injected.splitlines()
                         if ln.strip() and (_line_match_words & set(_re.findall(r"\b\w{4,}\b", ln.lower())))
                     ] if _topic_filter_words else []
+                    # Strip confirmed-status words from the line before checking
+                    # for pending signals — prevents "confirmed" from matching the
+                    # "confirm" pending word via substring, which caused lines like
+                    # "Flights and ground transport confirmed" to be misclassified
+                    # as pending.
+                    def _pending_check(ln: str) -> bool:
+                        scrubbed = ln.lower()
+                        for cw in _confirmed_words:
+                            scrubbed = scrubbed.replace(cw, "")
+                        return any(w in scrubbed for w in _pending_words)
+
                     _topic_confirmed = [
                         ln for ln in _topic_lines
                         if any(w in ln.lower() for w in _confirmed_words)
-                        and not any(w in ln.lower() for w in _pending_words)
+                        and not _pending_check(ln)
                     ]
                     _topic_pending = [
                         ln for ln in _topic_lines
-                        if any(w in ln.lower() for w in _pending_words)
+                        if _pending_check(ln)
                     ]
                     # Cross-trip contamination guard: if the query is about a
                     # specific named trip, exclude confirmed/pending lines whose
@@ -2229,14 +2252,58 @@ class PepperCore:
                     if _topic_confirmed or _topic_pending:
                         _status_lines = []
                         if _topic_confirmed:
-                            _status_lines.append("ALREADY CONFIRMED/DONE: " + " | ".join(_topic_confirmed[:4]))
+                            # Extract individual confirmed-word phrases as short explicit facts
+                            # so the model cannot miss them in a long bullet line.
+                            _explicit_facts: list[str] = []
+                            for _cln in _topic_confirmed[:4]:
+                                for _cfact in ("flights and ground transport confirmed",
+                                               "lodging booked", "flights confirmed",
+                                               "booked", "confirmed"):
+                                    if _cfact in _cln.lower():
+                                        _explicit_facts.append(f"• {_cfact.upper()}")
+                                        break
+                            # For hotel/lodging queries, extract the specific hotel name
+                            # and check-in date so the model does not have to infer them.
+                            _hotel_query = any(
+                                t in _last_content
+                                for t in ("what hotel", "which hotel", "where are we staying",
+                                          "hotel are we", "what's the hotel", "what is the hotel",
+                                          "where is the hotel", "check-in", "check in")
+                            )
+                            _hotel_facts: list[str] = []
+                            if _hotel_query:
+                                for _cln in _topic_confirmed[:4]:
+                                    # Extract bold hotel name e.g. **Four Points Sheraton**
+                                    _hm = _re.search(r'\*\*([^*]{4,40})\*\*', _cln)
+                                    if _hm:
+                                        _hotel_facts.append(f"• HOTEL NAME: {_hm.group(1)}")
+                                    # Extract check-in date e.g. "hotel check-in Susan July 4"
+                                    _chk = _re.search(
+                                        r'(?:hotel\s+)?check-?in\s+(\w+(?:\s+\w+){0,3})',
+                                        _cln, _re.IGNORECASE,
+                                    )
+                                    if _chk:
+                                        _hotel_facts.append(f"• CHECK-IN: {_chk.group(1)}")
+                            _all_facts = _hotel_facts + _explicit_facts
+                            _status_lines.append(
+                                "ALREADY CONFIRMED/DONE — DO NOT CONTRADICT:\n"
+                                + " | ".join(_all_facts if _all_facts else _topic_confirmed[:4])
+                            )
                         if _topic_pending:
                             _status_lines.append("STILL NEEDS ACTION: " + " | ".join(_topic_pending[:4]))
                         _status_preamble = (
-                            "[PRE-COMPUTED STATUS for this query topic:\n"
+                            "[PRE-COMPUTED STATUS for this query topic — TREAT AS GROUND TRUTH:\n"
                             + "\n".join(_status_lines)
-                            + "\nUse this summary to answer directly — do NOT contradict it."
-                            + "\nDo NOT reproduce or reference this [PRE-COMPUTED STATUS ...] block in your response.]\n\n"
+                            + "\nCRITICAL: You MUST accept the ALREADY CONFIRMED/DONE list above as fact. "
+                            "If something is listed as CONFIRMED/DONE, you are FORBIDDEN from saying it "
+                            "is unconfirmed, still needed, or not yet booked. Stating otherwise is factually wrong. "
+                            "STILL NEEDS ACTION items are the only open items — if that list is empty, "
+                            "report that all logistics for this trip are confirmed. "
+                            "CRITICAL: These facts come from the owner's current life context document and "
+                            "OVERRIDE any older or conflicting memory entries. If memory says something is "
+                            "still needed but this block says it is confirmed, trust this block — the memory "
+                            "entry is stale. Answer using the confirmed facts in this block.\n"
+                            "Do NOT reproduce or reference this [PRE-COMPUTED STATUS ...] block in your response.]\n\n"
                         )
                     else:
                         _status_preamble = ""
@@ -2537,15 +2604,31 @@ class PepperCore:
             flags=_re_post.DOTALL,
         ).strip()
 
-        # Post-process: truncate at [Post-Generated Text] or similar Hermes3
-        # meta-labels that introduce verbose self-commentary after the real answer.
+        # Post-process: truncate at [Post-Generated Text], [Post-Answer Notes],
+        # or similar Hermes3 meta-labels that introduce verbose self-commentary
+        # after the real answer.
         _post_gen_match = _re_post.search(
-            r"\n*\[Post-Generated\b[^\]]*\]",
+            r"\n*\[Post-(?:Generated|Answer)\b[^\]]*\]",
             response_text,
             flags=_re_post.IGNORECASE,
         )
         if _post_gen_match:
             response_text = response_text[: _post_gen_match.start()].strip()
+
+        # Post-process: truncate at ## [End] or similar Hermes3 document-close markers.
+        _end_marker_match = _re_post.search(
+            r"\s*\n*##\s*\[End\]",
+            response_text,
+            flags=_re_post.IGNORECASE,
+        )
+        if _end_marker_match:
+            response_text = response_text[: _end_marker_match.start()].strip()
+
+        # Post-process: strip standalone --- separators that Hermes3 appends as
+        # document dividers. Strip trailing --- with or without trailing whitespace,
+        # and --- that is followed only by whitespace/newlines to end of string.
+        response_text = _re_post.sub(r"(\s*\n---\s*)+$", "", response_text).strip()
+        response_text = _re_post.sub(r"\s+---\s*$", "", response_text).strip()
 
         # Add assistant response to working memory (skipped for isolated calls).
         if not isolated:
