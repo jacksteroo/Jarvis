@@ -331,6 +331,8 @@ class PepperCore:
         """
         _meta_patterns = [
             r"[^\n.!?]*\bin this provided context\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bin the provided context\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bgiven in the provided\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bthose should be included in the facts\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bshould be included in the facts\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bIf additional details or pending tasks were needed\b[^\n.!?]*[.!?]?",
@@ -362,6 +364,21 @@ class PepperCore:
             r"[^\n.!?]*\bLet me know if you (?:need|have|want)\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bFeel free to ask\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bHope that helps\b[^\n.!?]*[.!?]?",
+            # Strip generic motivational / relationship-advice closers
+            r"[^\n.!?]*\beven small gestures\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bsmall gestures can make a big difference\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bby being present\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\byou can help \w+ feel more at ease\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bRemember,? (?:even|the most important|that)\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\ba little goes a long way\b[^\n.!?]*[.!?]?",
+            # Strip "please refer to the provided/relevant life context" directives
+            r"[^\n.!?]*\bplease refer to\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\brefer to the (?:relevant|provided)\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bof the provided life context\b[^\n.!?]*[.!?]?",
+            # Strip leaked PRE-COMPUTED STATUS preamble instructions the model sometimes echoes
+            r"[^\n.!?]*\bUse this summary to answer directly\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bDo NOT reproduce or reference this\b[^\n.!?]*[.!?]?",
+            r"\[PRE-COMPUTED STATUS[^\]]*\]",
         ]
         for pat in _meta_patterns:
             text = re.sub(pat, "", text, flags=re.IGNORECASE)
@@ -802,12 +819,14 @@ class PepperCore:
                 _routine_patterns = (
                     "workout", "stretching", "bedtime", "links", "sleep", "wake up",
                 )
-                # For family-logistics queries, also filter blocking/work-meeting noise.
+                # For family-logistics queries, also filter blocking/work-meeting noise
+                # and Jack's personal sports/hobby appointments (not family activities).
                 _work_patterns = (
                     "unavailable", "all hands", "eng all hands",
                     "validators", "operational review", "kysen:", "kysenpool",
                     "weekly check-in", "weekly sync", "out of office",
                     "jack /",
+                    "badminton", "pickleball", "golf", "chess",
                 ) if _family_logistics_early else ()
                 cal_events_raw = cal_result["events"][:20]
                 if _risk_query or _family_logistics_early:
@@ -2185,6 +2204,19 @@ class PepperCore:
                         for _tk, _ta in _TRIP_ANCHORS.items():
                             if _ta.isdisjoint(_query_trip_terms):
                                 _other_trip_terms |= _ta
+                        # Also exclude lines from locally distinct locations that
+                        # aren't trip anchors but would pollute a travel query.
+                        # E.g. when asking about Harvard/Boston, exclude Cupertino
+                        # lines (Elite college prep program is a separate item).
+                        _LOCATION_EXCLUSIONS: dict[str, set[str]] = {
+                            "harvard": {"cupertino"},
+                            "boston": {"cupertino"},
+                            "east": {"cupertino"},
+                            "coast": {"cupertino"},
+                            "orlando": {"cupertino"},
+                        }
+                        for _qtt in _query_trip_terms:
+                            _other_trip_terms |= _LOCATION_EXCLUSIONS.get(_qtt, set())
                         if _other_trip_terms:
                             _topic_confirmed = [
                                 ln for ln in _topic_confirmed
