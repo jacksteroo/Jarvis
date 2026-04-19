@@ -27,11 +27,11 @@ Use the CONTINUOUS_IMPROVEMENT_PLAN.md to guide your fault taxonomy and fix appr
 
 ## Step 1 — Simulate a Life / Executive Assistant Question
 
-Pick **one question** that the owner would plausibly ask Pepper right now. The question must:
+Pick **one question** that the owner would plausibly ask Pepper right now. The question:
 
-- Be similar to real open loops or active situations in LIFE_CONTEXT.md (upcoming trip lodging, college tours, travel for a child, college application deadlines, my spouse's career, investments, meal planning, etc.)
-- Feel like something the owner would actually send — direct, short, practical
-- Test a meaningful capability: calendar awareness, commitment tracking, travel logistics, family triage, research, or proactive surfacing
+- may or may not be similar to real open loops or active situations in LIFE_CONTEXT.md (upcoming trip lodging, college tours, travel for a child, college application deadlines, my spouse's career, investments, meal planning, etc.)
+- must feel like something the owner would actually send — direct, short, practical
+- must test a meaningful capability: calendar awareness, commitment tracking, travel logistics, family triage, research, or proactive surfacing
 
 Good example questions:
 
@@ -39,19 +39,19 @@ Good example questions:
 
 - "What's left to confirm for the summer trip?"
 - "Is my child's flight sorted?"
-- "Any update on the Uber Teen account for the upcoming trip?"
-- "What hotel are we in for the college tour?"
-- "Do we have a rental car for the college visit trip?"
+- "Any updates received via emails or messages on my upcoming trip?"
+- "What hotel are we in for the trip to the East Coast?"
+- "Do we have a rental car for my upcoming trip?"
 - "When does my child leave and when do they get back?"
 - "What's the drive time between the two campus visits?"
-- "Have I booked anything for the next leg of the college tour?"
+- "Have I booked anything for the next leg of the sports tour?"
 - "What are the check-in times for our hotel?"
 - "What's the status of the lodging for the trip next month?"
-- "Do I need to book anything for the college tour before end of month?"
+- "Do I need to book anything for the Europe trip before end of month?"
 - "What's the earliest flight back on Sunday?"
 - "Are the kids' passports still valid for the summer?"
 - "Did I sort ground transport for the trip?"
-- "What's open on the college tour itinerary that still needs booking?"
+- "What's open on the Asia trip itinerary that still needs booking?"
 
 ### Family & Kids
 
@@ -64,7 +64,7 @@ Good example questions:
 - "What does my child have going on this month?"
 - "Any family commitments I'm forgetting about this week?"
 - "What school events are coming up in the next two weeks?"
-- "Is there anything I need to do before my child's trip?"
+- "Is there anything I need to do to help my child's grades?"
 - "What summer programs is my child still waiting to hear back from?"
 - "When is the next school break and do we have plans?"
 - "What did I say I'd do for the kids this weekend?"

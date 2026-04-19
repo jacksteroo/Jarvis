@@ -710,7 +710,8 @@ class PepperCore:
         if not sections:
             return None
 
-        # Append top open loops from life context so triage briefs surface family/logistics items
+        # Append open loops and, for family/logistics queries, kids activities
+        # from life context so triage briefs surface what matters most.
         try:
             from agent.life_context import get_life_context_sections
             lc_sections = get_life_context_sections(self.config.LIFE_CONTEXT_PATH)
@@ -722,6 +723,29 @@ class PepperCore:
                 ][:4]
                 if loop_lines:
                     sections.append("Open loops:\n" + "\n".join(loop_lines))
+            # For queries specifically about family logistics, also surface the
+            # kids activities / upcoming travels sections so high-priority events
+            # (tournaments, programs, college tours) are not invisible in the triage.
+            _msg_lower = user_message.lower()
+            _family_logistics_query = (
+                "family" in _msg_lower and (
+                    "logistics" in _msg_lower
+                    or "important" in _msg_lower
+                    or "next" in _msg_lower
+                    or "coming up" in _msg_lower
+                )
+            )
+            if _family_logistics_query:
+                kids_text = lc_sections.get("Kids — Activities and What Needs Attention", "")
+                if kids_text:
+                    kids_lines = [
+                        ln.strip() for ln in kids_text.splitlines()
+                        if ln.strip().startswith("-") or ln.strip().startswith("**")
+                    ][:6]
+                    if kids_lines:
+                        sections.append(
+                            "Upcoming family / kids items:\n" + "\n".join(kids_lines)
+                        )
         except Exception:
             pass
 
@@ -1840,10 +1864,21 @@ class PepperCore:
                            "this", "with", "been", "will", "when", "from", "your", "about"}
                     )
                     _topic_filter_words = _topic_words - _non_topic_words
+                    # Strip generic logistics nouns from line-matching so a query
+                    # about "East Coast college tour lodging" doesn't match the
+                    # Orlando "Lodging booked" line via the word "lodging".
+                    # Trip-specific terms (east, coast, college, tour, orlando…)
+                    # remain and correctly scope the match to one trip.
+                    _generic_logistics_terms = {
+                        "lodging", "hotel", "hotels", "flight", "flights",
+                        "transport", "rental", "status", "booking",
+                    }
+                    _specific_topic_words = _topic_filter_words - _generic_logistics_terms
+                    _line_match_words = _specific_topic_words if _specific_topic_words else _topic_filter_words
                     _topic_lines = [
                         ln.strip()
                         for ln in _injected.splitlines()
-                        if ln.strip() and (_topic_filter_words & set(_re.findall(r"\b\w{4,}\b", ln.lower())))
+                        if ln.strip() and (_line_match_words & set(_re.findall(r"\b\w{4,}\b", ln.lower())))
                     ] if _topic_filter_words else []
                     _topic_confirmed = [
                         ln for ln in _topic_lines
@@ -1854,6 +1889,46 @@ class PepperCore:
                         ln for ln in _topic_lines
                         if any(w in ln.lower() for w in _pending_words)
                     ]
+                    # Cross-trip contamination guard: if the query is about a
+                    # specific named trip, exclude confirmed/pending lines whose
+                    # trip-name anchor belongs to a DIFFERENT trip. This prevents
+                    # e.g. Orlando lodging confirmations from being applied to an
+                    # East Coast college tour query just because that Orlando line
+                    # also mentions "college campus tours".
+                    # Each key is a term a query might contain; the value is
+                    # the full set of anchor words that identify the SAME trip.
+                    # East Coast / Boston / Harvard are all the same trip.
+                    # Orlando / AAU / volleyball are all the same trip.
+                    _TRIP_ANCHORS: dict[str, set[str]] = {
+                        "orlando": {"orlando"},
+                        "aau": {"aau", "orlando"},
+                        "volleyball": {"aau", "orlando"},
+                        "east": {"east", "coast", "boston", "harvard"},
+                        "coast": {"east", "coast", "boston", "harvard"},
+                        "boston": {"east", "coast", "boston", "harvard"},
+                        "harvard": {"east", "coast", "boston", "harvard"},
+                        "malaysia": {"malaysia"},
+                        "japan": {"japan"},
+                        "china": {"china"},
+                    }
+                    _query_trip_terms: set[str] = set()
+                    for _tk, _ta in _TRIP_ANCHORS.items():
+                        if _tk in _last_content:
+                            _query_trip_terms |= _ta
+                    if _query_trip_terms:
+                        _other_trip_terms: set[str] = set()
+                        for _tk, _ta in _TRIP_ANCHORS.items():
+                            if _ta.isdisjoint(_query_trip_terms):
+                                _other_trip_terms |= _ta
+                        if _other_trip_terms:
+                            _topic_confirmed = [
+                                ln for ln in _topic_confirmed
+                                if not any(ot in ln.lower() for ot in _other_trip_terms)
+                            ]
+                            _topic_pending = [
+                                ln for ln in _topic_pending
+                                if not any(ot in ln.lower() for ot in _other_trip_terms)
+                            ]
                     if _topic_confirmed or _topic_pending:
                         _status_lines = []
                         if _topic_confirmed:
