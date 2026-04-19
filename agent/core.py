@@ -252,6 +252,14 @@ class PepperCore:
             (rf"\b{name}{_adv}\s+can\b", "You can"),
             (rf"\b{name}{_adv}\s+could\b", "You could"),
             (rf"\b{name}'s\b", "your"),
+            # Object-position preposition patterns ("with Jack", "for Jack", etc.)
+            (rf"\bwith\s+{name}\b", "with you"),
+            (rf"\bto\s+{name}\b", "to you"),
+            (rf"\bfor\s+{name}\b", "for you"),
+            (rf"\band\s+{name}\b", "and you"),
+            (rf"\b{name}\s+and\b", "you and"),
+            # Catch-all: any remaining standalone owner name → "you"
+            (rf"\b{name}\b", "you"),
         )
         # Pronoun patterns applied only in segments without family member names.
         _pronoun_patterns = (
@@ -714,8 +722,15 @@ class PepperCore:
             "fall through", "slip", "at risk", "forget", "miss",
             "fall behind", "cracks", "overlooked", "drop",
         ))
+        # Detect open-loop priority queries — suppress email/calendar so the
+        # response focuses on life-context open loops rather than inbox noise.
+        _open_loop_query_early = any(t in _msg_lower_early for t in (
+            "open loop", "highest priority", "highest-priority",
+            "top priority", "biggest open loop", "most important open",
+            "most pressing", "open loops",
+        ))
 
-        if "email" in sources and not _family_logistics_early:
+        if "email" in sources and not _family_logistics_early and not _open_loop_query_early:
             result = await execute_get_email_summary(
                 {"account": "all", "count": 8, "hours": email_hours}
             )
@@ -760,7 +775,7 @@ class PepperCore:
                 "I'll dig in."
             )
 
-        if "calendar" in sources:
+        if "calendar" in sources and not _open_loop_query_early:
             # For family-logistics queries that ask about "next 30 days" or "month",
             # expand the calendar window so upcoming family events are visible.
             _msg_lower_cal = user_message.lower()
@@ -781,18 +796,33 @@ class PepperCore:
                 _routine_patterns = (
                     "workout", "stretching", "bedtime", "links", "sleep", "wake up",
                 )
+                # For family-logistics queries, also filter blocking/work-meeting noise.
+                _work_patterns = (
+                    "unavailable", "all hands", "eng all hands",
+                ) if _family_logistics_early else ()
                 cal_events_raw = cal_result["events"][:20]
                 if _risk_query or _family_logistics_early:
                     cal_events_raw = [
                         e for e in cal_events_raw
                         if not any(
                             p in (e.splitlines()[0] if isinstance(e, str) else str(e)).lower()
-                            for p in _routine_patterns
+                            for p in (*_routine_patterns, *_work_patterns)
                         )
                     ]
+                # Deduplicate by event title (first line) for 30-day family-logistics
+                # queries so recurring work meetings don't crowd out family events.
+                if _family_logistics_early and _thirty_day_window:
+                    _seen_titles: set[str] = set()
+                    _deduped: list = []
+                    for e in cal_events_raw:
+                        _title = (e.splitlines()[0] if isinstance(e, str) else str(e)).lower()
+                        if _title not in _seen_titles:
+                            _seen_titles.add(_title)
+                            _deduped.append(e)
+                    cal_events_raw = _deduped
                 cal_lines = [
                     f"- {e.splitlines()[0]}" if isinstance(e, str) else f"- {e}"
-                    for e in cal_events_raw[:8]
+                    for e in cal_events_raw[:10]
                 ]
                 cal_heading = (
                     "Calendar (next 30 days):" if cal_days == 30 else "Calendar this week:"
@@ -1552,6 +1582,9 @@ class PepperCore:
                 user_message, all_routings
             )
             if routed_summary:
+                _rs_owner_first = (self.config.OWNER_NAME or "").split()[0]
+                if _rs_owner_first:
+                    routed_summary = self._sanitize_owner_address(routed_summary, _rs_owner_first)
                 if not isolated:
                     self.memory.add_to_working_memory("assistant", routed_summary)
                 chat_logger.info("chat_out", text=routed_summary[:1000])
@@ -1618,9 +1651,17 @@ class PepperCore:
             await _progress("Scanning calendar, inbox, messages, memory...")
             proactive_fetch_started = time.perf_counter()
 
+            # Suppress web search for open-loop priority queries — searching the web
+            # for "open loop" returns irrelevant engineering/finance results, not personal data.
+            _is_open_loop_query = any(t in user_message.lower() for t in (
+                "open loop", "open loops", "highest priority", "highest-priority",
+                "top priority", "most important open", "biggest open loop",
+            ))
             fetch_results = await asyncio.gather(
                 self.memory.build_context_for_query(user_message),
-                self._maybe_search_web(user_message, skip=routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT),
+                self._maybe_search_web(user_message, skip=(
+                    routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT or _is_open_loop_query
+                )),
                 self._maybe_get_driving_time(user_message),
                 maybe_get_calendar_context(trigger_text),
                 maybe_get_email_context(trigger_text),
@@ -1797,7 +1838,14 @@ class PepperCore:
                 "'appears to be', 'should be set up', 'might be', or any other hedged "
                 "form. If the life context says 'flights confirmed', say 'flights are "
                 "confirmed' — not 'flights seem to be set up'. Preserve the original "
-                "certainty level exactly."
+                "certainty level exactly.\n"
+                f"13. NEVER refer to the owner by name ({owner_first} or {owner_name}) "
+                "in your response. Always use 'you', 'your', or 'yourself'. "
+                f"Writing '{owner_first}' in a response is always wrong — replace it "
+                "with the appropriate second-person pronoun. "
+                "If a specific status (lodging, flights, transport) is NOT mentioned "
+                "in the life context, state it plainly as 'not yet confirmed — open item' "
+                "rather than suggesting the owner ask or follow up with anyone."
             )
             await _progress("Synthesizing response...")
 
@@ -1896,6 +1944,8 @@ class PepperCore:
             "summer programs", "summer program", "pre-college programs", "pre-college program",
             "program deadline", "program deadlines", "deadlines coming up",
             "deadlines are coming up", "what deadlines", "upcoming deadlines", "waiting to hear back",
+            "college deadline", "deadlines i need", "deadlines for matthew", "the deadlines",
+            "college stuff", "need to track",
             "still waiting to hear", "hear back from", "waiting on",
             "still waiting on", "pending decision", "pending decisions",
             "waiting for a decision", "application status", "application statuses",
@@ -2150,10 +2200,20 @@ class PepperCore:
                     else:
                         _status_preamble = ""
 
+                    _open_loop_tool_rule = (
+                        "TOOL RULE: This query is about personal open loops — do NOT call "
+                        "web_search. Answer entirely from the life context provided above.\n"
+                        if any(t in _last_content for t in (
+                            "open loop", "open loops", "highest priority", "highest-priority",
+                            "top priority", "most important open", "biggest open loop",
+                        ))
+                        else ""
+                    )
                     messages[-1] = {
                         "role": "user",
                         "content": (
-                            "[Life context facts — use these to answer the question below. "
+                            _open_loop_tool_rule
+                            + "[Life context facts — use these to answer the question below. "
                             "Quote ONLY the facts directly relevant to the specific topic named in the question. "
                             "If the question names a specific trip, event, or item (e.g. Orlando, Boston, Uber Teen), "
                             "answer only about that item — do NOT list other unrelated open loops or pending items. "
@@ -2199,7 +2259,7 @@ class PepperCore:
                             + _status_preamble
                             + _conflict_preamble
                             + _injected
-                            + "\n\n[PRE-ANSWER CHECK: Before writing your response, scan the life context above for the exact words 'Brown', 'Princeton', 'Yale', 'Columbia', 'Stanford', 'MIT', 'Cornell', 'Penn', 'Dartmouth', 'Duke'. If any of these do NOT appear verbatim in the text above, you are FORBIDDEN from naming them. For program/deadline questions: only name schools and deadlines that appear word-for-word in the life context above. If no specific program names or deadlines are in the text above for this topic, say so and do not invent any. IMPORTANT: The phrase 'some March 2026 deadlines were imminent' in the life context is a GENERAL NOTE — it does NOT give a specific date or program name. Do NOT assign this phrase as a deadline for Harvard or any other named program. Harvard's application deadline is NOT stated in the life context; only its start date (June 22, 2026) is confirmed. Do NOT say Harvard's deadline is any specific date. FINANCE/CRYPTO RULE: If the question is about crypto, portfolio, or financial investments: the life context explicitly states Jack is 'Avoiding: Crypto portfolio attention'. This means Jack has intentionally deprioritized the crypto portfolio. Do NOT say 'it might be a good idea to keep an eye on it' or suggest taking action. Instead, confirm it is an acknowledged open loop that Jack has consciously deferred, and note that no specific action is required unless he decides to re-engage. TRIP-SCOPING RULE: If the question asks about the Orlando volleyball trip or AAU Championships, ONLY report open items from the AAU Championships bullet in the life context. The 'Pre-college summer programs' bullet is about Matthew's academic programs and is completely unrelated to the Orlando volleyball trip — do NOT list it as an open item for Orlando. Apply the same principle to any named trip: only surface open items that belong to that specific trip's bullet or sub-section.]\n"
+                            + "\n\n[PRE-ANSWER CHECK: Before writing your response, scan the life context above for the exact words 'Brown', 'Princeton', 'Yale', 'Columbia', 'Stanford', 'Berkeley', 'UC Berkeley', 'MIT', 'Cornell', 'Penn', 'Dartmouth', 'Duke'. If any of these do NOT appear verbatim in the text above, you are FORBIDDEN from naming them. For program/deadline questions: only name schools and deadlines that appear word-for-word in the life context above. If no specific program names or deadlines are in the text above for this topic, say so and do not invent any. IMPORTANT: The phrase 'some March 2026 deadlines were imminent' in the life context is a GENERAL NOTE — it does NOT give a specific date or program name. Do NOT assign this phrase as a deadline for Harvard or any other named program. Harvard's application deadline is NOT stated in the life context; only its start date (June 22, 2026) is confirmed. Do NOT say Harvard's deadline is any specific date. COLLEGE TOUR DATES RULE: Do NOT invent specific campus tour dates (e.g. 'September 16', 'October 5'). Only state tour dates that appear verbatim in the life context. The only confirmed East Coast tour dates are July 5–8, 2026. Do NOT state any other specific tour date. COLLEGE APPLICATION DEADLINE RULE: Matthew's college application deadlines (Early Action, Regular Decision, etc.) are NOT stated anywhere in the life context. Do NOT write 'November 1', 'November 15', 'January 1', or any specific date as a college application deadline. If asked about application deadlines, say: 'No specific college application deadline dates are in your life context — check the college prep program or the schools' official sites directly.' FINANCE/CRYPTO RULE: If the question is about crypto, portfolio, or financial investments: the life context explicitly states Jack is 'Avoiding: Crypto portfolio attention'. This means Jack has intentionally deprioritized the crypto portfolio. Do NOT say 'it might be a good idea to keep an eye on it' or suggest taking action. Instead, confirm it is an acknowledged open loop that Jack has consciously deferred, and note that no specific action is required unless he decides to re-engage. OPEN-LOOP PRIORITY RULE: If the question asks about the highest-priority or most important open loop, rank the open loops in the life context by urgency and pick ONE as the top priority. Name it explicitly and give a one-sentence reason. Do NOT list all loops as equally important — the user asked for ONE. Time-sensitive items (closest deadline or start date) outrank acknowledged-but-deferred items. TRIP-SCOPING RULE: If the question asks about the Orlando volleyball trip or AAU Championships, ONLY report open items from the AAU Championships bullet in the life context. The 'Pre-college summer programs' bullet is about Matthew's academic programs and is completely unrelated to the Orlando volleyball trip — do NOT list it as an open item for Orlando. Apply the same principle to any named trip: only surface open items that belong to that specific trip's bullet or sub-section.]\n"
                             + "\n[Question:]\n"
                             + messages[-1]["content"]
                         ),
