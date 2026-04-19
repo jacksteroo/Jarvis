@@ -1722,11 +1722,20 @@ class PepperCore:
             "what's happening with", "what is happening with",
             "what's going on with", "what is going on with",
             "stand with", "things stand",
+            # Open loop / priority triage queries
+            "open loop", "highest priority", "highest-priority",
+            "top priority", "most important open", "biggest open loop",
+            "what's on my plate", "what is on my plate",
+            "most important thing", "single most important",
             # Application / research status queries — prevent hallucination
             "did we apply", "did i apply", "have we applied", "have i applied",
             "applied to", "which programs", "which schools", "which colleges",
             "which pre-college", "what programs", "what schools",
             "what did we apply", "what did i apply",
+            "summer programs", "pre-college programs", "waiting to hear back",
+            "still waiting to hear", "hear back from", "waiting on",
+            "still waiting on", "pending decision", "pending decisions",
+            "waiting for a decision", "application status", "application statuses",
             # Schedule conflict / date-overlap queries — must consult life context
             "conflict", "scheduling conflict", "schedule conflict",
             "date conflict", "conflicts for", "conflict for",
@@ -1771,7 +1780,8 @@ class PepperCore:
                 _CHILD_QUERY_TERMS = (
                     "matthew", "connor", "dylan", "kids", "children", "sons",
                     "pre-college", "harvard", "boston", "volleyball", "uber teen",
-                    "college tour", "aau",
+                    "college tour", "aau", "child", "son", "my kid",
+                    "summer programs", "summer program",
                 )
                 if any(t in _last_content for t in _PARTNER_QUERY_TERMS):
                     _relevant_headings = (

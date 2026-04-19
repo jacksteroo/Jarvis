@@ -146,6 +146,11 @@ _CROSS_SOURCE_TERMS = (
     "one thing i'd regret", "time-sensitive i need to act",
     "what's coming up in the next", "what am i most at risk",
     "what open loop", "blocking something else",
+    "open loop", "highest priority", "highest-priority",
+    "highest priority open", "top priority", "top open loop",
+    "biggest open loop", "most important open loop",
+    "what's on my plate", "what is on my plate",
+    "single most important", "most important thing",
 )
 
 # Person-lookup regex patterns
