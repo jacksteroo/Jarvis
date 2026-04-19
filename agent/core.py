@@ -832,9 +832,9 @@ class PepperCore:
         else:
             grader = self._make_grader()
             lines = [f"I found {len(emails)} email(s) in {scope_text} from the last {hours} hours."]
+            shown: list[str] = []
             if important:
                 lines.append("")
-                shown: list[str] = []
                 for item in important:
                     tag = grader.grade(item)
                     if tag == "ignore":
@@ -844,7 +844,7 @@ class PepperCore:
                 if shown:
                     lines.append("Most important:")
                     lines.extend(shown)
-            else:
+            if not shown:
                 lines.append("")
                 # Grade all emails and show urgent/important ones first
                 tagged = grader.grade_batch(emails[:10])
