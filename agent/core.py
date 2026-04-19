@@ -1653,7 +1653,12 @@ class PepperCore:
                 "section — read that section carefully before concluding anything is "
                 "unconfirmed. Do NOT call get_upcoming_events, "
                 "get_calendar_events_range, get_driving_time, or any other tool "
-                "for these questions — the answer is in your life context.\n"
+                "for these questions — the answer is in your life context. "
+                "IMPORTANT SCOPING RULE: When the question names a specific trip or "
+                "event (e.g. 'Orlando', 'Boston', 'volleyball'), ONLY surface items "
+                "that are directly related to that specific trip. Do NOT pull in open "
+                "loops or notes about unrelated programs or events that happen to "
+                "appear near the relevant trip in the life context.\n"
                 "10. Items listed in 'Open Loops Taking Up Mental Space' or "
                 "'Active Challenges' are explicitly NOT resolved. If asked "
                 "'is X sorted/done/confirmed?' and X appears as an open loop, "
@@ -2028,6 +2033,13 @@ class PepperCore:
                             "that trip. Do NOT list logistics, confirmations, or open items from other trips as if "
                             "they belong to the named trip. For example, if asked about the Orlando trip, the East "
                             "Coast college tour is a separate concurrent trip — do not include it. "
+                            "CRITICAL EXAMPLE — WHAT NOT TO DO: If asked 'What is still left to sort for the "
+                            "Orlando volleyball trip?', do NOT say 'The only thing left is confirming Matthew's "
+                            "pre-college summer programs.' Matthew's summer programs (Harvard Quantum Computing "
+                            "program, application statuses) are a completely separate topic — they are NOT part "
+                            "of the Orlando volleyball trip logistics. The Orlando volleyball trip logistics are "
+                            "contained entirely within the AAU Boys Junior National Volleyball Championships "
+                            "bullet. Answer based on that bullet only. "
                             "CRITICAL: If the question asks 'is X sorted/done/confirmed/set up?' and X appears in the "
                             "Open Loops section below, the answer MUST start with 'Not yet' or 'No' — "
                             "open loops are unresolved by definition. State what still needs to happen. "
@@ -2051,7 +2063,7 @@ class PepperCore:
                             + _status_preamble
                             + _conflict_preamble
                             + _injected
-                            + "\n\n[PRE-ANSWER CHECK: Before writing your response, scan the life context above for the exact words 'Brown', 'Princeton', 'Yale', 'Columbia', 'Stanford', 'MIT', 'Cornell', 'Penn', 'Dartmouth', 'Duke'. If any of these do NOT appear verbatim in the text above, you are FORBIDDEN from naming them. For program/deadline questions: only name schools and deadlines that appear word-for-word in the life context above. If no specific program names or deadlines are in the text above for this topic, say so and do not invent any. IMPORTANT: The phrase 'some March 2026 deadlines were imminent' in the life context is a GENERAL NOTE — it does NOT give a specific date or program name. Do NOT assign this phrase as a deadline for Harvard or any other named program. Harvard's application deadline is NOT stated in the life context; only its start date (June 22, 2026) is confirmed. Do NOT say Harvard's deadline is any specific date. FINANCE/CRYPTO RULE: If the question is about crypto, portfolio, or financial investments: the life context explicitly states Jack is 'Avoiding: Crypto portfolio attention'. This means Jack has intentionally deprioritized the crypto portfolio. Do NOT say 'it might be a good idea to keep an eye on it' or suggest taking action. Instead, confirm it is an acknowledged open loop that Jack has consciously deferred, and note that no specific action is required unless he decides to re-engage.]\n"
+                            + "\n\n[PRE-ANSWER CHECK: Before writing your response, scan the life context above for the exact words 'Brown', 'Princeton', 'Yale', 'Columbia', 'Stanford', 'MIT', 'Cornell', 'Penn', 'Dartmouth', 'Duke'. If any of these do NOT appear verbatim in the text above, you are FORBIDDEN from naming them. For program/deadline questions: only name schools and deadlines that appear word-for-word in the life context above. If no specific program names or deadlines are in the text above for this topic, say so and do not invent any. IMPORTANT: The phrase 'some March 2026 deadlines were imminent' in the life context is a GENERAL NOTE — it does NOT give a specific date or program name. Do NOT assign this phrase as a deadline for Harvard or any other named program. Harvard's application deadline is NOT stated in the life context; only its start date (June 22, 2026) is confirmed. Do NOT say Harvard's deadline is any specific date. FINANCE/CRYPTO RULE: If the question is about crypto, portfolio, or financial investments: the life context explicitly states Jack is 'Avoiding: Crypto portfolio attention'. This means Jack has intentionally deprioritized the crypto portfolio. Do NOT say 'it might be a good idea to keep an eye on it' or suggest taking action. Instead, confirm it is an acknowledged open loop that Jack has consciously deferred, and note that no specific action is required unless he decides to re-engage. TRIP-SCOPING RULE: If the question asks about the Orlando volleyball trip or AAU Championships, ONLY report open items from the AAU Championships bullet in the life context. The 'Pre-college summer programs' bullet is about Matthew's academic programs and is completely unrelated to the Orlando volleyball trip — do NOT list it as an open item for Orlando. Apply the same principle to any named trip: only surface open items that belong to that specific trip's bullet or sub-section.]\n"
                             + "\n[Question:]\n"
                             + messages[-1]["content"]
                         ),
