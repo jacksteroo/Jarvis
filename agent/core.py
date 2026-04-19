@@ -700,10 +700,28 @@ class PepperCore:
             if "error" in cal_result:
                 sections.append(f"Calendar: unavailable ({cal_result['error']})")
             elif cal_result.get("events"):
-                # Each event is a pre-formatted multi-line string; use first line for brevity
+                # For risk/slip queries, filter out routine recurring items so
+                # important time-sensitive events are visible.
+                _msg_lower_cal = user_message.lower()
+                _risk_query = any(t in _msg_lower_cal for t in (
+                    "fall through", "slip", "at risk", "forget", "miss",
+                    "fall behind", "cracks", "overlooked", "drop",
+                ))
+                _routine_patterns = (
+                    "workout", "stretching", "bedtime", "links", "sleep", "wake up",
+                )
+                cal_events_raw = cal_result["events"][:10]
+                if _risk_query:
+                    cal_events_raw = [
+                        e for e in cal_events_raw
+                        if not any(
+                            p in (e.splitlines()[0] if isinstance(e, str) else str(e)).lower()
+                            for p in _routine_patterns
+                        )
+                    ]
                 cal_lines = [
                     f"- {e.splitlines()[0]}" if isinstance(e, str) else f"- {e}"
-                    for e in cal_result["events"][:6]
+                    for e in cal_events_raw[:6]
                 ]
                 sections.append("Calendar this week:\n" + "\n".join(cal_lines))
 
@@ -749,10 +767,19 @@ class PepperCore:
         except Exception:
             pass
 
+        _msg_lower_heading = user_message.lower()
+        _risk_heading_query = any(t in _msg_lower_heading for t in (
+            "fall through", "slip", "at risk", "forget", "miss",
+            "fall behind", "cracks", "overlooked", "drop",
+        ))
         heading = (
-            "Here’s what looks most important across your inbox and messages:"
-            if len(sections) > 1
-            else "Here’s what stands out:"
+            "Here’s what’s most at risk of slipping this week:"
+            if _risk_heading_query
+            else (
+                "Here’s what looks most important across your inbox and messages:"
+                if len(sections) > 1
+                else "Here’s what stands out:"
+            )
         )
         return "\n\n".join([heading, *sections])
 
@@ -1630,13 +1657,14 @@ class PepperCore:
                 "the answer is NO — still outstanding. NEVER describe an open "
                 "loop item as completed, done, or set up. Report it as still "
                 "pending and state what action is needed.\n"
-                "11. For questions about specific program names, school names, or "
-                "application statuses where the life context only says research was "
-                "done or deadlines are approaching without naming the specific "
-                "programs: state exactly what the life context says (e.g. 'Research "
-                "was done and March 2026 deadlines were approaching'), then say "
-                "'Specific program names and current status aren't in your life "
-                "context — check your notes or email to confirm.' Do not invent names."
+                "11. For questions about summer programs, pre-college programs, or "
+                "application statuses: FIRST surface any programs explicitly named "
+                "and confirmed in the life context (e.g. 'Matthew is confirmed for "
+                "the Harvard pre-college Quantum Computing program, June 22'). THEN, "
+                "for any remaining programs mentioned only by category without specific "
+                "names, state exactly what the life context says and add 'Other specific "
+                "program names and application statuses aren't in your life context — "
+                "check your notes or email.' Do not invent names or statuses."
             )
             await _progress("Synthesizing response...")
 
@@ -1878,7 +1906,7 @@ class PepperCore:
                     # Pre-compute a confirmed/pending status summary for any
                     # named topic so the model gets the answer directly instead
                     # of having to infer it from "confirmed" vs unconfirmed text.
-                    _confirmed_words = {"confirmed", "booked"}
+                    _confirmed_words = {"confirmed", "booked", "starting june", "starting july", "starting august", "starting may", "two weeks starting", "program ends"}
                     _pending_words = {"confirm", "check", "follow", "tbd", "unknown", "missing", "needed", "needed"}
                     # Strip action verbs and classifier words from topic_words so
                     # common words like "confirm" or "left" don't produce false
@@ -1981,10 +2009,22 @@ class PepperCore:
                             "Open Loops section below, the answer MUST start with 'Not yet' or 'No' — "
                             "open loops are unresolved by definition. State what still needs to happen. "
                             "Do NOT add details from your training knowledge or prior conversations. "
-                            "CRITICAL: If the context mentions programs or applications by category without "
-                            "specific names, summarize only what IS in the context and say 'Specific program "
-                            "names are not in your life context — check your notes or email.' Never invent "
-                            "program or school names.]\n"
+                            "CRITICAL: If the context says someone 'confirmed to start' a role on a specific "
+                            "future date (e.g. 'confirmed to start with PayPal on May 18 2026'), they have NOT "
+                            "yet changed jobs — they are ABOUT TO start. Use future tense: 'Susan is confirmed "
+                            "to start at PayPal on May 18, 2026' not 'recently changed jobs'. "
+                            "CRITICAL: In 'startup at Tipalti' — 'startup' describes Tipalti (it is a startup "
+                            "company), NOT that Susan recently started working there. Tipalti is her CURRENT "
+                            "employer. She is LEAVING Tipalti for PayPal. Do not say she recently started Tipalti. "
+                            "Use the current system timestamp to calculate how far away a future date is — "
+                            "never say 'next year' if the date is within the same year. "
+                            "CRITICAL: If the Children section names a specific program with a start date "
+                            "(e.g. 'Summer 2026: Harvard pre-college Quantum Computing program, Boston — "
+                            "two weeks starting June 22'), that program IS CONFIRMED — report it as confirmed. "
+                            "If additional programs are mentioned only by category without specific names or dates "
+                            "(e.g. 'Extensive research done; some deadlines were imminent'), summarize what the "
+                            "context says and add 'Other specific application statuses are not in your life "
+                            "context — check your notes or email.' Never invent program or school names.]\n"
                             + _status_preamble
                             + _conflict_preamble
                             + _injected
