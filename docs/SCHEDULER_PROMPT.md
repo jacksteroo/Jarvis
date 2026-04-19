@@ -266,11 +266,11 @@ After making the change, verify the edit looks correct by reading the changed se
 
 ## Step 5 — Restart Docker and Verify
 
-After every fix, restart Pepper using Docker Compose from the project directory:
+After every fix, rebuild docker container (not just restart) of Pepper using Docker Compose from the project directory:
 
 ```bash
 cd [Pepper-project-directory]
-docker compose down pepper && docker compose up -d pepper
+docker compose down && docker compose up -d --build
 ```
 
 Wait for the pepper container to be healthy before proceeding. Check with:

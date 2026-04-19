@@ -60,6 +60,7 @@ class JARViSTelegramBot:
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
         )
+        self._app.add_error_handler(self._error_handler)
 
     async def start(self) -> None:
         """Start polling. Runs until stop() is called."""
@@ -194,7 +195,23 @@ class JARViSTelegramBot:
             logger.error("cmd_status_failed", error=str(e))
             await update.message.reply_text("Failed to fetch status.")
 
+    async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Global error handler — log the exception so it doesn't surface as an unhandled crash."""
+        logger.error(
+            "telegram_unhandled_error",
+            error=str(context.error),
+            update=str(update)[:200] if update else None,
+        )
+
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Guard against updates where message or text is None (e.g. edited messages,
+        # channel posts, or inline-query results that slip through the TEXT filter).
+        if update.message is None or update.message.text is None:
+            logger.debug(
+                "telegram_non_text_update_skipped",
+                update_id=getattr(update, "update_id", None),
+            )
+            return
         if not await self._check_auth(update):
             return
         user_message = update.message.text

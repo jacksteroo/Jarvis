@@ -327,11 +327,20 @@ class PepperCore:
             r"[^\n.!?]*\bIf additional details or pending tasks were needed\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bbased on the information provided\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bin the context given\b[^\n.!?]*[.!?]?",
+            r"As per [^,.\n]*life context[^,.\n]*,\s*",
+            r"As per [^,.\n]*information[^,.\n]*,\s*",
+            r"According to [^,.\n]*life context[^,.\n]*,\s*",
+            r"Based on [^,.\n]*life context[^,.\n]*,\s*",
+            r"\bIt is mentioned that\b\s*",
+            r"\bAs mentioned in [^\n,]*,\s*",
         ]
         for pat in _meta_patterns:
             text = re.sub(pat, "", text, flags=re.IGNORECASE)
         # Collapse multiple blank lines left after stripping
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        # Capitalize start of response if lowercased by stripping a sentence opener
+        if text and text[0].islower():
+            text = text[0].upper() + text[1:]
         return text
 
     @classmethod
@@ -1596,7 +1605,14 @@ class PepperCore:
                 "'is X sorted/done/confirmed?' and X appears as an open loop, "
                 "the answer is NO — still outstanding. NEVER describe an open "
                 "loop item as completed, done, or set up. Report it as still "
-                "pending and state what action is needed."
+                "pending and state what action is needed.\n"
+                "11. For questions about specific program names, school names, or "
+                "application statuses where the life context only says research was "
+                "done or deadlines are approaching without naming the specific "
+                "programs: state exactly what the life context says (e.g. 'Research "
+                "was done and March 2026 deadlines were approaching'), then say "
+                "'Specific program names and current status aren't in your life "
+                "context — check your notes or email to confirm.' Do not invent names."
             )
             await _progress("Synthesizing response...")
 
@@ -1847,7 +1863,8 @@ class PepperCore:
                         _status_preamble = (
                             "[PRE-COMPUTED STATUS for this query topic:\n"
                             + "\n".join(_status_lines)
-                            + "\nUse this summary to answer directly — do NOT contradict it.]\n\n"
+                            + "\nUse this summary to answer directly — do NOT contradict it."
+                            + "\nDo NOT reproduce or reference this [PRE-COMPUTED STATUS ...] block in your response.]\n\n"
                         )
                     else:
                         _status_preamble = ""
@@ -1862,7 +1879,11 @@ class PepperCore:
                             "CRITICAL: If the question asks 'is X sorted/done/confirmed/set up?' and X appears in the "
                             "Open Loops section below, the answer MUST start with 'Not yet' or 'No' — "
                             "open loops are unresolved by definition. State what still needs to happen. "
-                            "Do NOT add details from your training knowledge or prior conversations.]\n"
+                            "Do NOT add details from your training knowledge or prior conversations. "
+                            "CRITICAL: If the context mentions programs or applications by category without "
+                            "specific names, summarize only what IS in the context and say 'Specific program "
+                            "names are not in your life context — check your notes or email.' Never invent "
+                            "program or school names.]\n"
                             + _status_preamble
                             + _conflict_preamble
                             + _injected
@@ -2053,6 +2074,17 @@ class PepperCore:
         # Post-process: strip LLM meta-commentary that leaks context-window framing
         # into executive-assistant responses (e.g. "in this provided context").
         response_text = self._strip_meta_commentary(response_text)
+
+        # Post-process: strip any [PRE-COMPUTED STATUS ...] block that leaked
+        # into the model output. Hermes3 sometimes echoes the internal instruction
+        # preamble despite explicit instructions not to.
+        import re as _re_post
+        response_text = _re_post.sub(
+            r"\s*\[PRE-COMPUTED STATUS[^\]]*\]",
+            "",
+            response_text,
+            flags=_re_post.DOTALL,
+        ).strip()
 
         # Add assistant response to working memory (skipped for isolated calls).
         if not isolated:
