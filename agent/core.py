@@ -677,14 +677,39 @@ class PepperCore:
         sections: list[str] = []
         email_hours = detect_email_time_window_hours(user_message)
 
-        if "email" in sources:
+        # Detect family-logistics queries early so we can suppress irrelevant
+        # email/comms noise when the user is specifically asking about family.
+        _msg_lower_early = user_message.lower()
+        _family_logistics_early = (
+            "family" in _msg_lower_early and (
+                "logistics" in _msg_lower_early
+                or "important" in _msg_lower_early
+                or "next" in _msg_lower_early
+                or "coming up" in _msg_lower_early
+            )
+        )
+        # Detect risk/slip queries — for these, only show email if there are
+        # genuinely urgent or important items (not just newsletter listings).
+        _risk_query_early = any(t in _msg_lower_early for t in (
+            "fall through", "slip", "at risk", "forget", "miss",
+            "fall behind", "cracks", "overlooked", "drop",
+        ))
+
+        if "email" in sources and not _family_logistics_early:
             result = await execute_get_email_summary(
                 {"account": "all", "count": 8, "hours": email_hours}
             )
             if "error" in result:
                 sections.append(f"Email: unavailable ({result['error']})")
             elif result.get("emails"):
-                sections.append(f"Email:\n{self._format_email_summary_response(result, 'all')}")
+                email_text = self._format_email_summary_response(result, "all")
+                # For risk/slip queries, skip the email section when there are
+                # no urgent items — "Nothing looks especially urgent" + newsletters
+                # is noise, not a risk signal.
+                if _risk_query_early and "Nothing looks especially urgent" in email_text:
+                    pass
+                else:
+                    sections.append(f"Email:\n{email_text}")
 
         if "imessage" in sources:
             result = await execute_get_recent_imessage_attention(
@@ -796,9 +821,13 @@ class PepperCore:
             "Here’s what’s most at risk of slipping this week:"
             if _risk_heading_query
             else (
-                "Here’s what looks most important across your inbox and messages:"
-                if len(sections) > 1
-                else "Here’s what stands out:"
+                "Here’s the key family logistics coming up:"
+                if _family_logistics_early
+                else (
+                    "Here’s what looks most important across your inbox and messages:"
+                    if len(sections) > 1
+                    else "Here’s what stands out:"
+                )
             )
         )
         return "\n\n".join([heading, *sections])
@@ -2092,6 +2121,11 @@ class PepperCore:
                             "employer. She is LEAVING Tipalti for PayPal. Do not say she recently started Tipalti. "
                             "Use the current system timestamp to calculate how far away a future date is — "
                             "never say 'next year' if the date is within the same year. "
+                            "CRITICAL: Internal action notes in the life context (e.g. 'May affect household "
+                            "scheduling — plan accordingly', 'confirm current application status', 'plan accordingly') "
+                            "are INTERNAL REMINDERS, not facts to echo verbatim. Do NOT copy these phrases "
+                            "into your response word-for-word. Convey the implication naturally in your own voice "
+                            "or omit the reminder if the user did not ask for next steps. "
                             "CRITICAL: If the Children section names a specific program with a start date "
                             "(e.g. 'Summer 2026: Harvard pre-college Quantum Computing program, Boston — "
                             "two weeks starting June 22'), that program IS CONFIRMED — report it as confirmed. "
