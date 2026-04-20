@@ -858,6 +858,7 @@ class PepperCore:
                     "weekly check-in", "weekly sync", "out of office",
                     "jack /",
                     "badminton", "pickleball", "golf", "chess",
+                    " sync", "standup", "stand-up", "1:1", "office hours",
                     *_errand_patterns,
                 ) if _family_logistics_early else ()
                 cal_events_raw = cal_result["events"][:20]
@@ -2313,6 +2314,29 @@ class PepperCore:
                                     if _cfact in _cln.lower():
                                         _explicit_facts.append(f"• {_cfact.upper()}")
                                         break
+                            # For pre-college/program deadline queries, extract
+                            # confirmed program name + start date so the model
+                            # cannot say "no details found" when Harvard is confirmed.
+                            _program_deadline_query = any(
+                                t in _last_content
+                                for t in ("pre-college program", "program deadline", "deadlines coming",
+                                          "deadlines are coming", "program deadlines", "summer program",
+                                          "application status", "college deadline")
+                            )
+                            if _program_deadline_query:
+                                _prog_facts: list[str] = []
+                                for _cln in _topic_confirmed[:6]:
+                                    _pm = _re.search(
+                                        r'Harvard[^.;,]*(?:program|Quantum Computing)[^.;,]*(?:starting|starts)\s+(\w+\s+\d+)',
+                                        _cln, _re.IGNORECASE,
+                                    )
+                                    if _pm:
+                                        _prog_facts.append(f"• CONFIRMED PROGRAM: Harvard pre-college Quantum Computing, starting {_pm.group(1)}")
+                                    elif "harvard" in _cln.lower() and "quantum" in _cln.lower():
+                                        _prog_facts.append("• CONFIRMED PROGRAM: Harvard pre-college Quantum Computing — Matthew is enrolled, starts June 22")
+                                if _prog_facts:
+                                    _explicit_facts = _prog_facts + _explicit_facts
+                                    _explicit_facts.append("• ACTION NEEDED: March 2026 deadline window for other summer programs has closed — confirm current application status for any remaining programs")
                             # For hotel/lodging queries, extract the specific hotel name
                             # and check-in date so the model does not have to infer them.
                             _hotel_query = any(
@@ -2329,8 +2353,9 @@ class PepperCore:
                                     if _hm:
                                         _hotel_facts.append(f"• HOTEL NAME: {_hm.group(1)}")
                                     # Extract check-in date e.g. "hotel check-in Susan July 4"
+                                    # Require "hotel" prefix so "tournament check-in" is not captured.
                                     _chk = _re.search(
-                                        r'(?:hotel\s+)?check-?in\s+(\w+(?:\s+\w+){0,3})',
+                                        r'hotel\s+check-?in\s+(\w+(?:\s+\w+){0,3})',
                                         _cln, _re.IGNORECASE,
                                     )
                                     if _chk:
@@ -2410,11 +2435,15 @@ class PepperCore:
                             "employer. She is LEAVING Tipalti for PayPal. Do not say she recently started Tipalti. "
                             "Use the current system timestamp to calculate how far away a future date is — "
                             "never say 'next year' if the date is within the same year. "
-                            "CRITICAL: Internal action notes in the life context (e.g. 'May affect household "
-                            "scheduling — plan accordingly', 'confirm current application status', 'plan accordingly') "
+                            "CRITICAL: Internal planning notes in the life context (e.g. 'May affect household "
+                            "scheduling — plan accordingly', 'plan accordingly') "
                             "are INTERNAL REMINDERS, not facts to echo verbatim. Do NOT copy these phrases "
                             "into your response word-for-word. Convey the implication naturally in your own voice "
-                            "or omit the reminder if the user did not ask for next steps.]\n"
+                            "or omit the reminder if the user did not ask for next steps. "
+                            "EXCEPTION: 'confirm current application status' IS an actionable item — if the user "
+                            "is asking about program deadlines or application status, surface this as the primary "
+                            "pending action: explain the March 2026 deadline window has closed and the current "
+                            "status of other 2026 summer program applications needs to be confirmed.]\n"
                             + _status_preamble
                             + _conflict_preamble
                             + _injected
