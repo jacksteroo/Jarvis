@@ -374,6 +374,8 @@ class PepperCore:
             # Strip generic "significant adjustment for anyone/people" padding
             r",?\s*which can be a significant adjustment for (?:anyone|people|most)[^.!?]*[.!?]?",
             r",?\s*as (?:this|it) can be (?:a )?(?:significant|major|big) (?:adjustment|change) for (?:anyone|most)[^.!?]*[.!?]?",
+            # Strip "it would be wise/advisable for you to..." sentences (not caught by impersonal replacements)
+            r"[^\n.!?]*\bit would be (?:advisable|wise|prudent) for (?:you|him|her|them|Jack)\b[^\n.!?]*[.!?]?",
             # Strip "please refer to the provided/relevant life context" directives
             r"[^\n.!?]*\bplease refer to\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\brefer to the (?:relevant|provided)\b[^\n.!?]*[.!?]?",
@@ -883,10 +885,11 @@ class PepperCore:
                     f"- {e.splitlines()[0]}" if isinstance(e, str) else f"- {e}"
                     for e in cal_events_raw[:10]
                 ]
-                cal_heading = (
-                    "Calendar (next 30 days):" if cal_days == 30 else "Calendar this week:"
-                )
-                sections.append(cal_heading + "\n" + "\n".join(cal_lines))
+                if cal_lines:
+                    cal_heading = (
+                        "Calendar (next 30 days):" if cal_days == 30 else "Calendar this week:"
+                    )
+                    sections.append(cal_heading + "\n" + "\n".join(cal_lines))
 
         if not sections:
             return None
@@ -2085,10 +2088,25 @@ class PepperCore:
                     "invest", "401k", "401(k)", "financial", "finance", "money",
                     "wealth", "savings", "stock", "market", "assets",
                 )
+                _OPEN_LOOP_PRIORITY_TERMS = (
+                    "open loop", "open loops", "highest priority", "highest-priority",
+                    "top priority", "most important open", "biggest open loop",
+                    "most pressing open", "most important loop",
+                )
                 if any(t in _last_content for t in _PARTNER_QUERY_TERMS):
                     _relevant_headings = (
                         "Partner",
                         "Open Loops Taking Up Mental Space",
+                    )
+                elif any(t in _last_content for t in _OPEN_LOOP_PRIORITY_TERMS):
+                    # For explicit open-loop triage queries, surface the canonical
+                    # "Open Loops" section first so the model prioritizes it over
+                    # kids/travel detail that can dominate the else branch.
+                    _relevant_headings = (
+                        "Open Loops Taking Up Mental Space",
+                        "Active Challenges",
+                        "Partner",
+                        "What Jack Wants",
                     )
                 elif any(t in _last_content for t in _CHILD_QUERY_TERMS):
                     _relevant_headings = (
