@@ -392,10 +392,15 @@ class PepperCore:
             r"[^\n.!?]*\bno (?:specific |concrete )?(?:deadline|date|program|information)\b[^\n.!?]*\bcan be found\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bThe life context only provides\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bThe context does mention\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bThe text (?:mentions|states|says|indicates|notes)\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bthe text (?:mentions|states|says|indicates|notes)\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bin the given life context\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bwere provided in the\b[^\n.!?]*\bcontext\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bno (?:specific |further |additional )?details? (?:about|regarding|on)\b[^\n.!?]*\b(?:were|are) (?:provided|mentioned|listed|given)\b[^\n.!?]*[.!?]?",
             r"Other than (?:this|that),?\s*no (?:specific|further|additional)?\s*(?:details?|information)\b[^\n.!?]*[.!?]?",
+            # Strip verbatim echoes of internal LIFE_CONTEXT planning reminders
+            r"[^\n.!?]*\bmay affect (?:the )?household scheduling\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bcould affect (?:the )?household scheduling\b[^\n.!?]*[.!?]?",
         ]
         for pat in _meta_patterns:
             text = re.sub(pat, "", text, flags=re.IGNORECASE)
@@ -410,6 +415,9 @@ class PepperCore:
             (r"\bso it would be (?:advisable|wise|prudent) to\b", "—"),
             (r"[Ii]t'?s recommended to check directly with", "Check directly with"),
             (r"[Ii]t'?s (?:advised|recommended|suggested) to check", "Check"),
+            (r"[Ii]t'?s (?:advised|recommended|suggested) to verify", "Verify"),
+            (r"[Ii]t is (?:advised|recommended|suggested) to verify", "Verify"),
+            (r"[Ii]t'?s (?:advised|recommended|suggested) to plan accordingly", "Plan accordingly"),
         ]
         for pat, repl in _impersonal_replacements:
             text = re.sub(pat, repl, text, flags=re.IGNORECASE)
@@ -2036,6 +2044,11 @@ class PepperCore:
             "before his trip", "before her trip", "before the trip",
             "before matthew", "before my trip", "what needs to happen before",
             "prepare for", "ready for the trip", "ready for the program",
+            # Family logistics / schedule queries — must answer from life context, not hallucinate
+            "family logistics", "family commitments", "family schedule",
+            "family priorities", "family things", "what's coming up for the family",
+            "what is coming up for the family", "most important family",
+            "family items", "next 30 days", "next thirty days",
             # Partner / spouse status queries
             "susan's career", "susan's situation", "susan's job", "susan's role",
             "partner's career", "wife's career", "career situation",
@@ -2139,18 +2152,40 @@ class PepperCore:
                     "If asked 'is X sorted/done/confirmed?', answer NO.]\n"
                 )
                 _is_partner_query = any(t in _last_content for t in _PARTNER_QUERY_TERMS)
+                _is_family_logistics_query = any(t in _last_content for t in (
+                    "family logistics", "family commitments", "family schedule",
+                    "family priorities", "family things", "what's coming up for the family",
+                    "most important family", "family items",
+                ))
+                # Phrases that identify hard-excluded open-loop items for family queries:
+                # POA/Taiwan insurance, crypto portfolio — these must never appear in family answers.
+                _FAMILY_EXCLUDED_LOOP_PHRASES = (
+                    "poa", "taiwan", "insurance", "zhunpin", "accidental death",
+                    "cross-border fund", "sze yin",
+                    "crypto", "bitcoin", "ethereum", "portfolio",
+                )
 
                 def _maybe_filter_open_loops(heading: str, content: str) -> str:
-                    """For partner queries, keep only Susan-related open loops to
-                    prevent unrelated items (e.g. Taiwan insurance) being misattributed
-                    to Susan during model generation."""
-                    if heading != "Open Loops Taking Up Mental Space" or not _is_partner_query:
+                    """Filter open loops for partner or family-logistics queries."""
+                    if heading != "Open Loops Taking Up Mental Space":
                         return content
-                    filtered = "\n".join(
-                        ln for ln in content.splitlines()
-                        if not ln.strip() or "susan" in ln.lower() or ln.strip().startswith("#")
-                    )
-                    return filtered if filtered.strip() else content
+                    if _is_partner_query:
+                        # Keep only Susan-related open loops
+                        filtered = "\n".join(
+                            ln for ln in content.splitlines()
+                            if not ln.strip() or "susan" in ln.lower() or ln.strip().startswith("#")
+                        )
+                        return filtered if filtered.strip() else content
+                    if _is_family_logistics_query:
+                        # Remove hard-excluded items (POA/insurance, crypto)
+                        filtered = "\n".join(
+                            ln for ln in content.splitlines()
+                            if not ln.strip()
+                            or ln.strip().startswith("#")
+                            or not any(ex in ln.lower() for ex in _FAMILY_EXCLUDED_LOOP_PHRASES)
+                        )
+                        return filtered if filtered.strip() else content
+                    return content
 
                 _PAST_DEADLINE_PAT = re.compile(
                     r'some\s+(?:January|February|March)\s+20\d\d\s+deadlines\s+were\s+imminent',
@@ -2398,10 +2433,44 @@ class PepperCore:
                         ))
                         else ""
                     )
+
+                    # For queries with explicit time windows ("next 30 days", "next N days",
+                    # "this month", etc.), compute the cutoff date and inject it as a hard
+                    # constraint so the model cannot include events outside the window.
+                    import re as _re2
+                    _time_window_preamble = ""
+                    _now_for_window = datetime.now()
+                    _window_match = _re2.search(
+                        r'next\s+(\d+)\s+(day|days|week|weeks)',
+                        _last_content,
+                    )
+                    if _window_match:
+                        _n = int(_window_match.group(1))
+                        _unit = _window_match.group(2)
+                        from datetime import timedelta
+                        _delta = timedelta(days=_n if "day" in _unit else _n * 7)
+                        _cutoff = (_now_for_window + _delta).strftime("%B %-d, %Y")
+                        _today_str = _now_for_window.strftime("%B %-d, %Y")
+                        _time_window_preamble = (
+                            f"[TIME WINDOW ENFORCEMENT: The question asks about the next {_n} {_unit}. "
+                            f"Today is {_today_str}. The window ends on {_cutoff}. "
+                            f"ONLY include items that start on or before {_cutoff}. "
+                            f"ANY item starting after {_cutoff} must be EXCLUDED — do not mention it at all, "
+                            f"not even as a future preview. If no items fall within the window, say so explicitly.]\n\n"
+                        )
+                    elif any(t in _last_content for t in ("this month", "next month")):
+                        from datetime import timedelta
+                        _cutoff = (_now_for_window + timedelta(days=30)).strftime("%B %-d, %Y")
+                        _today_str = _now_for_window.strftime("%B %-d, %Y")
+                        _time_window_preamble = (
+                            f"[TIME WINDOW ENFORCEMENT: The question asks about this/next month. "
+                            f"Today is {_today_str}. Only include items starting on or before {_cutoff}.]\n\n"
+                        )
                     messages[-1] = {
                         "role": "user",
                         "content": (
-                            _open_loop_tool_rule
+                            _time_window_preamble
+                            + _open_loop_tool_rule
                             + "[Life context facts — use these to answer the question below. "
                             "Quote ONLY the facts directly relevant to the specific topic named in the question. "
                             "If the question names a specific trip, event, or item (e.g. Orlando, Boston, Uber Teen), "
