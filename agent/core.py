@@ -1955,14 +1955,19 @@ class PepperCore:
                 "the answer is NO — still outstanding. NEVER describe an open "
                 "loop item as completed, done, or set up. Report it as still "
                 "pending and state what action is needed.\n"
-                "11. For questions about summer programs, pre-college programs, or "
-                "application statuses: FIRST surface any programs explicitly named "
-                "and confirmed in the life context (e.g. 'Matthew is confirmed for "
-                "the Harvard pre-college Quantum Computing program, June 22'). THEN, "
-                "for any remaining programs mentioned only by category without specific "
-                "names, state exactly what the life context says and add 'Other specific "
-                "program names and application statuses aren't in your life context — "
-                "check your notes or email.' Do not invent names or statuses.\n"
+                "11. For questions about summer programs, pre-college programs, "
+                "program deadlines, or application statuses: FIRST surface any "
+                "programs explicitly named and confirmed in the life context — "
+                "state the program name, who it is for, and the start date "
+                "(e.g. 'Matthew is confirmed for the Harvard pre-college Quantum "
+                "Computing program, starting June 22'). A confirmed program's "
+                "START DATE is the most important upcoming item — treat it as the "
+                "primary answer to any 'what deadlines / what's coming up' question "
+                "in this category. THEN, for any remaining programs mentioned only "
+                "by category without specific names, state exactly what the life "
+                "context says and add 'Other specific program names and application "
+                "statuses aren't in your life context — check your notes or email.' "
+                "Do not invent names or statuses.\n"
                 "12. NEVER soften explicitly confirmed facts. When the life context uses "
                 "the words 'confirmed', 'booked', or 'sorted', reflect that exact level "
                 "of certainty in your answer. Do NOT downgrade to 'seems to be', "
@@ -2260,11 +2265,32 @@ class PepperCore:
                         content,
                     )
 
+                # For trip-specific queries (Orlando/AAU/volleyball), strip the
+                # pre-college programs bullet from the Kids Activities section so
+                # the model cannot cross-contaminate the trip answer with an
+                # unrelated academic-program note.
+                _TRIP_SPECIFIC_QUERY = any(
+                    t in _last_content
+                    for t in ("orlando", "aau", "volleyball trip", "volleyball championships",
+                               "boston trip", "east coast trip", "east coast college",
+                               "malaysia trip", "japan trip", "la trip", "la volleyball")
+                )
+                _PRE_COLLEGE_STRIP_PAT = re.compile(
+                    r'\*?\*?Pre-college summer programs[^\n]*\n?',
+                    re.IGNORECASE,
+                )
+
+                def _sanitize_section_trip(heading: str, content: str) -> str:
+                    sanitized = _sanitize_section(content)
+                    if _TRIP_SPECIFIC_QUERY and heading == "Kids — Activities and What Needs Attention":
+                        sanitized = _PRE_COLLEGE_STRIP_PAT.sub("", sanitized)
+                    return sanitized
+
                 _section_blocks = [
                     (
-                        f"## {h}\n{_open_loop_note}{_maybe_filter_open_loops(h, _sanitize_section(_lc_sections[h]))}"
+                        f"## {h}\n{_open_loop_note}{_maybe_filter_open_loops(h, _sanitize_section_trip(h, _lc_sections[h]))}"
                         if h == "Open Loops Taking Up Mental Space"
-                        else f"## {h}\n{_sanitize_section(_lc_sections[h])}"
+                        else f"## {h}\n{_sanitize_section_trip(h, _lc_sections[h])}"
                     )
                     for h in _relevant_headings
                     if _lc_sections.get(h)
@@ -2581,10 +2607,13 @@ class PepperCore:
                             "are INTERNAL REMINDERS, not facts to echo verbatim. Do NOT copy these phrases "
                             "into your response word-for-word. Convey the implication naturally in your own voice "
                             "or omit the reminder if the user did not ask for next steps. "
-                            "EXCEPTION: 'confirm current application status' IS an actionable item — if the user "
-                            "is asking about program deadlines or application status, surface this as the primary "
-                            "pending action: explain the March 2026 deadline window has closed and the current "
-                            "status of other 2026 summer program applications needs to be confirmed.]\n"
+                            "PROGRAM DEADLINE RULE: If the user asks about program deadlines or application "
+                            "status, FIRST state any confirmed programs from the Children section (e.g. "
+                            "'Matthew is confirmed for the Harvard pre-college Quantum Computing program, "
+                            "starting June 22, 2026'). THEN, for other programs mentioned only by category, "
+                            "note that the March 2026 application deadline window has passed and the current "
+                            "status needs to be confirmed. The confirmed Harvard program is the PRIMARY item "
+                            "to surface — do NOT skip it to discuss the deadline window.]\n"
                             + _status_preamble
                             + _conflict_preamble
                             + _injected
