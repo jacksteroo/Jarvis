@@ -2280,10 +2280,22 @@ class PepperCore:
                     re.IGNORECASE,
                 )
 
+                # Also strip Harvard/pre-college references from the Children section
+                # for trip-specific queries so the per-child background doesn't bleed
+                # into Orlando/AAU/volleyball trip status answers.
+                _HARVARD_STRIP_PAT = re.compile(
+                    r'[^\n]*(?:Harvard|pre-college|Quantum Computing|Boston.*program)[^\n]*\n?',
+                    re.IGNORECASE,
+                )
+
                 def _sanitize_section_trip(heading: str, content: str) -> str:
                     sanitized = _sanitize_section(content)
-                    if _TRIP_SPECIFIC_QUERY and heading == "Kids — Activities and What Needs Attention":
+                    if _TRIP_SPECIFIC_QUERY and heading in (
+                        "Kids — Activities and What Needs Attention",
+                    ):
                         sanitized = _PRE_COLLEGE_STRIP_PAT.sub("", sanitized)
+                    if _TRIP_SPECIFIC_QUERY and heading == "Children":
+                        sanitized = _HARVARD_STRIP_PAT.sub("", sanitized)
                     return sanitized
 
                 _section_blocks = [
@@ -2573,11 +2585,34 @@ class PepperCore:
                             f"[TIME WINDOW ENFORCEMENT: The question asks about this/next month. "
                             f"Today is {_today_str}. Only include items starting on or before {_cutoff}.]\n\n"
                         )
+                    # For Orlando/AAU/volleyball trip queries: inject a hard scope block
+                    # that forbids mentioning any other concurrent trip or program
+                    # (Harvard, Boston, East Coast college tour) in the response.
+                    _orlando_scope_preamble = ""
+                    _is_orlando_query = any(
+                        t in _last_content
+                        for t in ("orlando", "aau", "volleyball trip", "volleyball championships")
+                    )
+                    if _is_orlando_query:
+                        _orlando_scope_preamble = (
+                            "[ORLANDO TRIP SCOPE ENFORCEMENT: This question is specifically about "
+                            "the Orlando AAU volleyball trip. Your answer MUST be restricted to ONLY "
+                            "the AAU Boys Junior National Volleyball Championships bullet: dates July 7-10, "
+                            "Four Points Sheraton (Susan checks in July 4), flights and ground transport "
+                            "confirmed. FORBIDDEN — do NOT mention ANY of the following in your response: "
+                            "Harvard pre-college program, Matthew's Boston trip, East Coast college tour, "
+                            "pre-college programs, application status, Matthew's summer programs. "
+                            "Do NOT explain why Susan checks in first by referencing Jack's Boston/Harvard "
+                            "activities — that is a different trip. Simply state Susan checks in July 4 and "
+                            "move on. End your answer after listing the confirmed Orlando logistics.]\n\n"
+                        )
+
                     messages[-1] = {
                         "role": "user",
                         "content": (
                             _time_window_preamble
                             + _open_loop_tool_rule
+                            + _orlando_scope_preamble
                             + "[Life context facts — use these to answer the question below. "
                             "Quote ONLY the facts directly relevant to the specific topic named in the question. "
                             "If the question names a specific trip, event, or item (e.g. Orlando, Boston, Uber Teen), "
@@ -2635,7 +2670,7 @@ class PepperCore:
                             + _status_preamble
                             + _conflict_preamble
                             + _injected
-                            + "\n\n[PRE-ANSWER CHECK: Before writing your response, scan the life context above for the exact words 'Brown', 'Princeton', 'Yale', 'Columbia', 'Stanford', 'Berkeley', 'UC Berkeley', 'MIT', 'Cornell', 'Penn', 'Dartmouth', 'Duke'. If any of these do NOT appear verbatim in the text above, you are FORBIDDEN from naming them. For program/deadline questions: only name schools and deadlines that appear word-for-word in the life context above. If no specific program names or deadlines are in the text above for this topic, say so and do not invent any. IMPORTANT: The phrase 'some March 2026 deadlines were imminent' in the life context is a GENERAL NOTE — it does NOT give a specific date or program name. Do NOT assign this phrase as a deadline for Harvard or any other named program. Harvard's application deadline is NOT stated in the life context; only its start date (June 22, 2026) is confirmed. Do NOT say Harvard's deadline is any specific date. COLLEGE TOUR DATES RULE: Do NOT invent specific campus tour dates (e.g. 'September 16', 'October 5'). Only state tour dates that appear verbatim in the life context. The only confirmed East Coast tour dates are July 5–8, 2026. Do NOT state any other specific tour date. COLLEGE APPLICATION DEADLINE RULE: Matthew's college application deadlines (Early Action, Regular Decision, etc.) are NOT stated anywhere in the life context. Do NOT write 'November 1', 'November 15', 'January 1', or any specific date as a college application deadline. If asked about application deadlines, say: 'No specific college application deadline dates are in your life context — check the college prep program or the schools' official sites directly.' FINANCE/CRYPTO RULE: If the question is about crypto, portfolio, or financial investments: the life context explicitly states Jack is 'Avoiding: Crypto portfolio attention'. This means Jack has intentionally deprioritized the crypto portfolio. Do NOT say 'it might be a good idea to keep an eye on it' or suggest taking action. Instead, confirm it is an acknowledged open loop that Jack has consciously deferred, and note that no specific action is required unless he decides to re-engage. OPEN-LOOP PRIORITY RULE: If the question asks about the highest-priority or most important open loop, rank the open loops in the life context by urgency and pick ONE as the top priority. Name it explicitly and give a one-sentence reason. Do NOT list all loops as equally important — the user asked for ONE. Time-sensitive items (closest deadline or start date) outrank acknowledged-but-deferred items. TRIP-SCOPING RULE: If the question asks about the Orlando volleyball trip or AAU Championships, ONLY report open items from the AAU Championships bullet in the life context. The 'Pre-college summer programs' bullet is about Matthew's academic programs and is completely unrelated to the Orlando volleyball trip — do NOT list it as an open item for Orlando. Apply the same principle to any named trip: only surface open items that belong to that specific trip's bullet or sub-section. HARVARD PROGRAM NAMING RULE: The Harvard pre-college Quantum Computing program is a university-hosted summer program at Harvard in Boston — it is NOT a high-school program, NOT 'his school's program', NOT 'his high school's pre-college program'. Always refer to it by name: 'Harvard's pre-college Quantum Computing program' or 'Harvard pre-college program'. Never call it a 'high school program' or attach it to his high school.]\n"
+                            + "\n\n[PRE-ANSWER CHECK: Before writing your response, scan the life context above for the exact words 'Brown', 'Princeton', 'Yale', 'Columbia', 'Stanford', 'Berkeley', 'UC Berkeley', 'MIT', 'Cornell', 'Penn', 'Dartmouth', 'Duke'. If any of these do NOT appear verbatim in the text above, you are FORBIDDEN from naming them. For program/deadline questions: only name schools and deadlines that appear word-for-word in the life context above. If no specific program names or deadlines are in the text above for this topic, say so and do not invent any. IMPORTANT: The phrase 'some March 2026 deadlines were imminent' in the life context is a GENERAL NOTE — it does NOT give a specific date or program name. Do NOT assign this phrase as a deadline for Harvard or any other named program. Harvard's application deadline is NOT stated in the life context; only its start date (June 22, 2026) is confirmed. Do NOT say Harvard's deadline is any specific date. COLLEGE TOUR DATES RULE: Do NOT invent specific campus tour dates (e.g. 'September 16', 'October 5'). Only state tour dates that appear verbatim in the life context. The only confirmed East Coast tour dates are July 5–8, 2026. Do NOT state any other specific tour date. COLLEGE APPLICATION DEADLINE RULE: This rule applies ONLY to formal college admissions deadlines (Early Action, Regular Decision, etc. — the November/January dates for actually applying to college). It does NOT apply to pre-college summer program application deadlines. Matthew's formal college application deadlines (EA, RD, etc.) are NOT stated anywhere in the life context. Do NOT write 'November 1', 'November 15', 'January 1', or any specific date as a formal college application deadline. If asked specifically about college admissions deadlines (EA/RD), say: 'No specific college application deadline dates are in your life context — check the college prep program or the schools' official sites directly.' EXCEPTION: If the question is about pre-college summer program deadlines or application status, IGNORE this rule entirely and follow the PRE-COLLEGE PROGRAM DEADLINE RULE in the system prompt instead. FINANCE/CRYPTO RULE: If the question is about crypto, portfolio, or financial investments: the life context explicitly states Jack is 'Avoiding: Crypto portfolio attention'. This means Jack has intentionally deprioritized the crypto portfolio. Do NOT say 'it might be a good idea to keep an eye on it' or suggest taking action. Instead, confirm it is an acknowledged open loop that Jack has consciously deferred, and note that no specific action is required unless he decides to re-engage. OPEN-LOOP PRIORITY RULE: If the question asks about the highest-priority or most important open loop, rank the open loops in the life context by urgency and pick ONE as the top priority. Name it explicitly and give a one-sentence reason. Do NOT list all loops as equally important — the user asked for ONE. Time-sensitive items (closest deadline or start date) outrank acknowledged-but-deferred items. TRIP-SCOPING RULE: If the question asks about the Orlando volleyball trip or AAU Championships, ONLY report open items from the AAU Championships bullet in the life context. The 'Pre-college summer programs' bullet is about Matthew's academic programs and is completely unrelated to the Orlando volleyball trip — do NOT list it as an open item for Orlando. Apply the same principle to any named trip: only surface open items that belong to that specific trip's bullet or sub-section. HARVARD PROGRAM NAMING RULE: The Harvard pre-college Quantum Computing program is a university-hosted summer program at Harvard in Boston — it is NOT a high-school program, NOT 'his school's program', NOT 'his high school's pre-college program'. Always refer to it by name: 'Harvard's pre-college Quantum Computing program' or 'Harvard pre-college program'. Never call it a 'high school program' or attach it to his high school.]\n"
                             + "\n[Question:]\n"
                             + messages[-1]["content"]
                         ),
