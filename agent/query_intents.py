@@ -78,6 +78,10 @@ CALENDAR_QUERY_TERMS = (
     "what is on",
     "when am i",
     "do i have anything",
+    "deadline",
+    "deadlines",
+    "due date",
+    "due dates",
 )
 
 ATTENTION_INTENT_TERMS = (

@@ -19,9 +19,11 @@ from agent.error_classifier import (
 
 logger = structlog.get_logger()
 
-# hermes3 sometimes outputs tool calls as raw JSON text rather than using the
-# structured tool_calls field in the Ollama API response. These patterns cover
-# the two most common formats it uses.
+# Some local models emit tool calls as plain text instead of populating the
+# structured `message.tool_calls` field in the Ollama API response. Hermes 3
+# tends to emit raw JSON, while Hermes 4 commonly wraps the JSON payload in
+# `<tool_call>...</tool_call>` tags.
+_XML_TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TEXT_TOOL_CALL_PATTERNS = [
     # {"name": "search_images", "arguments": {...}}
     re.compile(r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}', re.DOTALL),
@@ -35,7 +37,36 @@ _TEXT_TOOL_CALL_PATTERNS = [
 
 
 def _extract_text_tool_calls(content: str) -> list[dict]:
-    """Parse hermes3's text-formatted tool calls into the standard tool_calls structure."""
+    """Parse text-formatted tool calls into the standard tool_calls structure."""
+    xml_matches = _XML_TOOL_CALL_PATTERN.findall(content)
+    parsed_calls: list[dict] = []
+    for i, payload in enumerate(xml_matches):
+        try:
+            tool_call = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        name = tool_call.get("name") or tool_call.get("function")
+        args = tool_call.get("arguments") or tool_call.get("args") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                continue
+
+        if isinstance(name, str) and isinstance(args, dict):
+            parsed_calls.append({
+                "id": f"call_{i}_{name}",
+                "function": {"name": name, "arguments": args},
+            })
+
+    if parsed_calls:
+        logger.debug(
+            "text_tool_call_detected",
+            names=[c["function"]["name"] for c in parsed_calls],
+        )
+        return parsed_calls
+
     for i, pattern in enumerate(_TEXT_TOOL_CALL_PATTERNS):
         m = pattern.search(content)
         if not m:
@@ -258,11 +289,25 @@ class ModelClient:
             options=options or {},
         )
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(
                 f"{self.config.OLLAMA_BASE_URL}/api/chat",
                 json=payload,
             )
+            # Ollama returns 400 when the model does not support native tool
+            # calling. Strip tools and retry — hermes models emit tool calls as
+            # plain text, which _extract_text_tool_calls handles below.
+            if resp.status_code == 400 and "tools" in payload:
+                logger.warning(
+                    "ollama_tools_rejected_retrying_without",
+                    model=model,
+                    body=resp.text[:300],
+                )
+                payload.pop("tools")
+                resp = await client.post(
+                    f"{self.config.OLLAMA_BASE_URL}/api/chat",
+                    json=payload,
+                )
             resp.raise_for_status()
             data = resp.json()
 
@@ -270,8 +315,8 @@ class ModelClient:
         content = message.get("content", "")
         tool_calls = message.get("tool_calls", [])
 
-        # hermes3 sometimes emits tool calls as raw JSON text content instead of
-        # using the structured tool_calls field. Detect and normalise.
+        # Some local models emit tool calls as text content instead of using the
+        # structured tool_calls field. Detect and normalise.
         if not tool_calls and content:
             tool_calls = _extract_text_tool_calls(content)
             if tool_calls:

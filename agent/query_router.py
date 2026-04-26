@@ -442,6 +442,10 @@ class QueryRouter:
             "sitting longest", "without progress", "longest without", "stale open",
             "sitting for more than", "sitting for months", "no progress",
             "been sitting", "without movement",
+            # Domain-scoped open-loop questions — fully answerable from life context
+            "financial open loop", "financial open loops",
+            "finance open loop", "finance open loops",
+            "biggest financial", "biggest finance",
         )
         if contains_any(normalized, _OPEN_LOOP_STALENESS_TERMS):
             d = RoutingDecision(
@@ -451,6 +455,27 @@ class QueryRouter:
                 time_scope=time_scope,
                 entity_targets=entity_targets,
                 reasoning="open-loop staleness query — answer from life context",
+            )
+            self._log(user_message, d)
+            return d
+
+        # ── 2c. Life-context mutation requests ────────────────────────────────────
+        # "Update the open loop for Susan...", "Correct the open loop...", etc.
+        # These only need update_life_context — route to ANSWER_FROM_CONTEXT so
+        # the LLM gets only the 4 memory tools (lightweight), and priority_routed_summary
+        # is skipped (it bails when all routings are ANSWER_FROM_CONTEXT).
+        _MUTATION_VERBS = ("update ", "correct ", "change ", "fix ", "modify ", "edit ")
+        _LIFE_CTX_TARGETS = ("open loop", "life context", "life_context")
+        _is_mutation = any(normalized.startswith(v) or f" {v}" in normalized for v in _MUTATION_VERBS)
+        _targets_life_ctx = contains_any(normalized, _LIFE_CTX_TARGETS)
+        if _is_mutation and _targets_life_ctx:
+            d = RoutingDecision(
+                intent_type=IntentType.CROSS_SOURCE_TRIAGE,
+                target_sources=[],
+                action_mode=ActionMode.ANSWER_FROM_CONTEXT,
+                time_scope=time_scope,
+                entity_targets=entity_targets,
+                reasoning="life-context mutation — answer from life context with memory tools",
             )
             self._log(user_message, d)
             return d
