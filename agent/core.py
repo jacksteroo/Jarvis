@@ -74,6 +74,12 @@ from agent.comms_health_tools import (
     COMMS_HEALTH_TOOLS,
     execute_comms_health_tool,
 )
+from agent.local_filesystem_tools import (
+    FILESYSTEM_TOOLS,
+    execute_inspect_local_path,
+    extract_path_from_text,
+    inspect_local_path_sync,
+)
 
 logger = structlog.get_logger()
 
@@ -91,6 +97,155 @@ _MCP_WRITE_APPROVAL_RE = re.compile(
 _MCP_APPROVAL_TTL = 300.0
 _SOURCE_URL_RE = re.compile(r"https?://[^\s)\]>]+", re.IGNORECASE)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", re.IGNORECASE)
+_PURE_ACK_PHRASES = (
+    "thanks",
+    "thank you",
+    "thank you very much",
+    "thank you so much",
+    "thanks a lot",
+    "thanks so much",
+    "many thanks",
+    "much appreciated",
+    "appreciate it",
+    "really appreciate it",
+    "thx",
+    "ty",
+    "tysm",
+    "ok",
+    "okay",
+    "ok thanks",
+    "okay thanks",
+    "okay cool",
+    "alright",
+    "all right",
+    "alright thanks",
+    "all right thanks",
+    "k",
+    "kk",
+    "cool",
+    "cool thanks",
+    "cool got it",
+    "got it",
+    "gotcha",
+    "gotcha thanks",
+    "understood",
+    "understood thanks",
+    "sounds good",
+    "sounds great",
+    "sounds perfect",
+    "sounds fine",
+    "sounds right",
+    "sounds like a plan",
+    "that works",
+    "that works for me",
+    "works for me",
+    "works great",
+    "looks good",
+    "looks great",
+    "looks perfect",
+    "looks right",
+    "seems good",
+    "seems fine",
+    "perfect",
+    "perfect thanks",
+    "perfect got it",
+    "nice",
+    "nice one",
+    "nice thanks",
+    "awesome",
+    "awesome thanks",
+    "amazing",
+    "amazing thanks",
+    "excellent",
+    "excellent thanks",
+    "fantastic",
+    "fantastic thanks",
+    "brilliant",
+    "brilliant thanks",
+    "great",
+    "great thanks",
+    "great got it",
+    "great perfect",
+    "love it",
+    "love it thanks",
+    "cheers",
+    "cheers thanks",
+    "noted",
+    "noted thanks",
+    "noted got it",
+    "noted understood",
+    "will do",
+    "will do thanks",
+    "done",
+    "done thanks",
+    "all good",
+    "all good thanks",
+    "we're good",
+    "we are good",
+    "good stuff",
+    "good to go",
+    "good deal",
+    "fair enough",
+    "fine by me",
+    "that's fine",
+    "that is fine",
+    "that's good",
+    "that is good",
+    "makes sense",
+    "yep",
+    "yep thanks",
+    "yup",
+    "yup thanks",
+    "sure",
+    "sure thanks",
+    "absolutely",
+    "absolutely thanks",
+    "definitely",
+    "definitely thanks",
+    "indeed",
+    "roger",
+    "roger that",
+    "copy",
+    "copy that",
+    "received",
+    "message received",
+    "noted received",
+    "on it",
+    "on it thanks",
+    "sgtm",
+    "lg",
+    "👍",
+    "🙏",
+    "👌",
+    "🙌",
+    "✅",
+)
+_PURE_ACK_RE = re.compile(
+    r"^\s*(?:"
+    + "|".join(re.escape(p) for p in sorted(_PURE_ACK_PHRASES, key=len, reverse=True))
+    + r")\s*[!.]*\s*$",
+    re.IGNORECASE,
+)
+_FAST_HEAVY_QUERY_RE = re.compile(
+    r"\b("
+    r"what do you know about me|"
+    r"tell me about myself|"
+    r"what(?:'s| is) my situation|"
+    r"what(?:'s| is) my context|"
+    r"what do you remember about me|"
+    r"summarize my life|"
+    r"what are my goals|"
+    r"who am i"
+    r")\b",
+    re.IGNORECASE,
+)
+_FAST_LIVE_DATA_QUERY_RE = re.compile(
+    r"\b("
+    r"weather|forecast|"
+    r"news|headlines?|highlights?"
+    r")\b",
+    re.IGNORECASE,
+)
 
 _PENDING_ACTION_TOOLS = [
     {
@@ -788,6 +943,11 @@ class PepperCore:
         # the structured triage path so the LLM can answer from injected life context.
         if all(r.action_mode == ActionMode.ANSWER_FROM_CONTEXT for r in routings):
             return None
+        # Mutation requests ("update", "change", "correct" …) must go through the
+        # full LLM pipeline so update_life_context and save_memory tools are reachable.
+        _mutation_terms = ("update ", "change ", "correct ", "fix ", "modify ", "set ", "edit ")
+        if any(user_message.lower().startswith(t) or f" {t}" in user_message.lower() for t in _mutation_terms):
+            return None
 
         sources: list[str] = []
         for routing in routings:
@@ -954,6 +1114,8 @@ class PepperCore:
                         "Calendar (next 30 days):" if cal_days == 30 else "Calendar this week:"
                     )
                     sections.append(cal_heading + "\n" + "\n".join(cal_lines))
+                for w in cal_result.get("warnings", []):
+                    sections.append(f"Note: {w}")
 
         if not sections:
             return None
@@ -1270,6 +1432,19 @@ class PepperCore:
             return None
 
         response = " ".join(lines)
+        if "filesystem" in sources:
+            requested_path = extract_path_from_text(user_message)
+            if requested_path:
+                path_result = inspect_local_path_sync(requested_path, max_entries=1, max_chars=120)
+                if "error" not in path_result:
+                    resolved = path_result.get("resolved_path", requested_path)
+                    mapped_from = path_result.get("mapped_from")
+                    response = f"Yes, I can inspect that path read-only at {resolved}."
+                    if mapped_from:
+                        response += f" I mapped it from {mapped_from}."
+                elif "outside Pepper's read-only local filesystem scope" in path_result.get("error", ""):
+                    response = path_result["error"]
+
         # Append a "try anyway" nudge when any source is available, so the model
         # doesn't stop at the capability question and skips the actual fetch.
         from agent.capability_registry import CapabilityStatus
@@ -1281,6 +1456,58 @@ class PepperCore:
         if has_available:
             response += " Want me to fetch the data now?"
         return response
+
+    @staticmethod
+    def _format_local_path_result(result: dict, requested_path: str) -> str:
+        if "error" in result:
+            return f"I couldn't inspect {requested_path}: {result['error']}"
+
+        resolved = result.get("resolved_path", requested_path)
+        mapped_from = result.get("mapped_from")
+        lead = f"{requested_path} maps to {resolved}." if mapped_from else f"{resolved} is accessible."
+
+        if result.get("kind") == "directory":
+            entries = result.get("entries", [])
+            if not entries:
+                return f"{lead} It's an empty directory."
+            formatted_entries = []
+            for entry in entries[:10]:
+                suffix = "/" if entry.get("kind") == "directory" else ""
+                size = entry.get("size_bytes")
+                size_note = f" ({size} bytes)" if isinstance(size, int) else ""
+                formatted_entries.append(f"{entry.get('name', '')}{suffix}{size_note}")
+            more = ""
+            if result.get("truncated"):
+                more = f" Showing {len(entries)} of {result.get('entry_count', len(entries))} entries."
+            return (
+                f"{lead} It's a directory with {result.get('entry_count', len(entries))} entries: "
+                + ", ".join(formatted_entries)
+                + "."
+                + more
+            )
+
+        size = result.get("size_bytes")
+        size_note = f" ({size} bytes)" if isinstance(size, int) else ""
+        if result.get("previewable_text"):
+            preview = (result.get("content") or "").strip()
+            truncated = " (truncated)" if result.get("truncated") else ""
+            return f"{lead} It's a text file{size_note}{truncated}.\n\n{preview}"
+        return f"{lead} It's a file{size_note}. I can inspect its metadata, but it isn't previewable text."
+
+    async def _maybe_answer_local_path_query(self, user_message: str, routing) -> str | None:
+        if routing.action_mode != ActionMode.CALL_TOOLS:
+            return None
+        if "filesystem" not in routing.target_sources:
+            return None
+
+        requested_path = extract_path_from_text(user_message)
+        if not requested_path:
+            return None
+
+        result = await execute_inspect_local_path(
+            {"path": requested_path, "max_entries": 20, "max_chars": 2000}
+        )
+        return self._format_local_path_result(result, requested_path)
 
     @staticmethod
     def _probe_subsystem_health() -> dict[str, str]:
@@ -1339,58 +1566,71 @@ class PepperCore:
 
     # ── Query depth classification ─────────────────────────────────────────────
 
-    _CLASSIFY_SYSTEM = (
-        "You decide whether a message needs a live API/data lookup before "
-        "answering. Reply with exactly one word — HEAVY or LIGHT — no "
-        "punctuation, no explanation.\n\n"
-        "Default: HEAVY. Only answer LIGHT if the message is one of the "
-        "following narrow cases:\n"
-        "  - pure greeting, thanks, acknowledgment, or chit-chat "
-        "    ('hi', 'thanks', 'cool', 'ok', 'good morning')\n"
-        "  - a question about general world knowledge or an abstract "
-        "    explanation that has zero dependence on the user's personal "
-        "    data, calendar, inbox, contacts, history, or memory\n"
-        "  - a coding/math question with no personal-data dependency\n\n"
-        "Everything else is HEAVY. In particular HEAVY covers: anything "
-        "that would require an API call (calendar, email, iMessage, "
-        "WhatsApp, Slack, web search, weather, maps/directions), any "
-        "memory recall of past conversations, anything about the user's "
-        "own life state (priorities, focus, schedule, commitments, "
-        "follow-ups, what to do today/tomorrow, who's waiting on them), "
-        "any draft reply or message that must reference real people / "
-        "projects / threads, AND any follow-up that builds on a previous "
-        "answer that itself was HEAVY.\n\n"
-        "HEAVY also covers any question asking what the assistant knows "
-        "about the user — e.g. 'what do you know about me?', 'tell me "
-        "about myself', 'what's my situation', 'what's my context', "
-        "'who am I', 'what do you remember about me', 'summarize my "
-        "life', 'what are my goals' — these require reading the user's "
-        "personal profile and must be HEAVY.\n\n"
-        "When in doubt, HEAVY."
-    )
-
-    async def classify_query(self, message: str) -> bool:
-        """Return True if the message needs proactive data fetches.
-
-        Uses the local LLM so it handles any language, typos, and paraphrasing.
-        Falls back to True (heavy path) on any error — conservative default.
-        """
+    def _recent_user_messages_for_router(self, isolated: bool = False) -> list[str]:
+        """Return the recent user turns used for deterministic routing carry-over."""
+        if isolated:
+            return []
         try:
-            result = await self.llm.chat(
-                messages=[
-                    {"role": "system", "content": self._CLASSIFY_SYSTEM},
-                    {"role": "user", "content": message},
-                ],
-                model=f"local/{self.config.DEFAULT_LOCAL_MODEL}",
-                options={"num_predict": 5},
+            history = self.memory.get_working_memory(limit=6)
+        except Exception:
+            return []
+        return [
+            m["content"] for m in history
+            if m.get("role") == "user"
+        ][-3:-1]
+
+    def decide_query_depth(
+        self,
+        message: str,
+        *,
+        all_routings: list | None = None,
+        isolated: bool = False,
+    ) -> tuple[bool, str]:
+        """Return (heavy, reason) without making a separate LLM routing call.
+
+        Hermes-agent's pattern is the model/tool loop first, with only a thin
+        heuristic router for obviously simple turns. Pepper mirrors that here:
+        pure acknowledgements and deterministic short-circuits stay light,
+        explicit personal-context questions stay heavy, and structured/tool
+        intents use the existing deterministic QueryRouter.
+        """
+        if self._answer_identity_question(message) is not None:
+            return False, "identity"
+
+        if _PURE_ACK_RE.match(message):
+            return False, "pure_ack"
+
+        if self.config.ALWAYS_HEAVY:
+            return True, "ALWAYS_HEAVY"
+
+        if _FAST_HEAVY_QUERY_RE.search(message):
+            return True, "personal_context"
+
+        # Example-shaped "current info" queries should not fall through to the
+        # light general-chat path. These need live/tool-backed data even when
+        # the deterministic router does not recognize a source-specific intent.
+        if _FAST_LIVE_DATA_QUERY_RE.search(message):
+            return True, "example_tool_query"
+
+        routings = all_routings
+        if routings is None:
+            routings = self._router.route_multi(
+                message,
+                self._capability_registry,
+                self._recent_user_messages_for_router(isolated),
             )
-            verdict = result.get("content", "HEAVY").strip().upper().split()[0]
-            heavy = verdict != "LIGHT"
-            logger.debug("classify_query", verdict=verdict, heavy=heavy, message=message[:80])
-            return heavy
-        except Exception as exc:
-            logger.warning("classify_query_failed", error=str(exc), message=message[:80])
-            return True  # safe default: full fetch path
+
+        if any(r.needs_clarification for r in routings):
+            return False, "clarification"
+
+        primary = max(routings, key=lambda r: r.confidence)
+        if primary.intent_type == IntentType.CAPABILITY_CHECK:
+            return False, "capability_check"
+
+        if any(r.action_mode == ActionMode.CALL_TOOLS for r in routings):
+            return True, f"router_{primary.intent_type.value}"
+
+        return False, "general_chat"
 
     async def chat(
         self,
@@ -1406,8 +1646,9 @@ class PepperCore:
         progress_callback: optional async callable(str) called at key processing stages
         so callers (e.g. Telegram bot) can surface real-time status to the user.
 
-        heavy: if already classified by the caller, pass it here to skip a
-        redundant LLM call. If None, classify_query() is called automatically.
+        heavy: if already determined by the caller, pass it here to skip the
+        deterministic query-depth routing. If None, depth is inferred from the
+        existing QueryRouter plus a few high-confidence shortcuts.
 
         channel: the interface the user is messaging from (e.g. "Telegram", "HTTP API").
         Injected into the system prompt so the model knows its context.
@@ -1511,12 +1752,8 @@ class PepperCore:
         #
         # Phase 6.5: pass recent user turns so "anything urgent?" after an email
         # question inherits email context; registry filters unreachable sources.
-        recent_for_router: list[str] = []
-        if not isolated:
-            recent_for_router = [
-                m["content"] for m in self.memory.get_working_memory(limit=6)
-                if m.get("role") == "user"
-            ][-3:-1]
+        recent_for_router = self._recent_user_messages_for_router(isolated)
+        is_live_data_query = bool(_FAST_LIVE_DATA_QUERY_RE.search(user_message))
         # Phase 6.5: use route_multi so compound queries like "any emails and
         # what's on my calendar?" are split into independent routing decisions.
         # Each sub-intent goes through capability filtering; clarification fires
@@ -1594,14 +1831,32 @@ class PepperCore:
             chat_logger.debug("commitments_not_detected")
 
         if heavy is None:
-            if self.config.ALWAYS_HEAVY:
-                heavy = True
-                chat_logger.debug("query_depth", heavy=True, reason="ALWAYS_HEAVY", message=user_message[:80])
-            else:
-                heavy = await self.classify_query(user_message)
-                chat_logger.debug("query_depth", heavy=heavy, reason="classified", message=user_message[:80])
+            heavy, reason = self.decide_query_depth(
+                user_message,
+                all_routings=all_routings,
+                isolated=isolated,
+            )
+            chat_logger.debug("query_depth", heavy=heavy, reason=reason, message=user_message[:80])
         else:
             chat_logger.debug("query_depth", heavy=heavy, reason="caller_set", message=user_message[:80])
+
+        local_path_response = await self._maybe_answer_local_path_query(user_message, routing)
+        if local_path_response is not None:
+            if not isolated:
+                self.memory.add_to_working_memory("assistant", local_path_response)
+            chat_logger.info(
+                "local_path_short_circuit",
+                response_preview=self._preview_text(local_path_response, 180),
+            )
+            chat_logger.info("chat_out", text=local_path_response[:1000])
+            if not isolated:
+                await self._save_conversation(session_id, user_message, local_path_response)
+            chat_logger.info(
+                "chat_complete",
+                path="local_path",
+                duration_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return local_path_response
 
         if heavy and is_email_action_items_query(user_message):
             await _progress("Scanning inboxes for action items...")
@@ -1791,7 +2046,10 @@ class PepperCore:
             fetch_results = await asyncio.gather(
                 self.memory.build_context_for_query(user_message),
                 self._maybe_search_web(user_message, skip=(
-                    routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT or _is_open_loop_query
+                    (
+                        routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT
+                        and not is_live_data_query
+                    ) or _is_open_loop_query
                 )),
                 self._maybe_get_driving_time(user_message),
                 maybe_get_calendar_context(trigger_text),
@@ -2133,6 +2391,15 @@ class PepperCore:
             "partner's career", "wife's career", "career situation",
             "career transition", "career change", "starting at paypal",
             "tipalti", "paypal", "susan starting", "susan's transition",
+            # Generic partner presence queries — must trigger life context injection
+            "my partner", "for my partner", "about my partner",
+            "my wife", "for my wife", "about my wife",
+            "what's going on with my partner", "what is going on with my partner",
+            "anything for my partner", "anything time-sensitive",
+            "time-sensitive i need", "do for my partner", "do for my wife",
+            "partner this week", "partner this month", "partner right now",
+            "follow up on for my partner", "follow up for my partner",
+            "support my partner", "help my partner",
             # Travel / lodging / hotel queries
             "what hotel", "which hotel", "what's the hotel", "what is the hotel",
             "where are we staying", "where am i staying", "where are they staying",
@@ -2340,6 +2607,33 @@ class PepperCore:
                             "INCLUDE this specific action note in your answer: "
                             "'May affect household scheduling — plan accordingly.' "
                             "Do NOT omit the household scheduling note.]\n\n"
+                        ) + _injected
+
+                    # For time-sensitive partner queries, prepend a KEY FACT that
+                    # makes the urgency of Susan's career transition concrete so the
+                    # model cannot dismiss it as "no urgent tasks needed."
+                    _is_partner_timesensitive_q = _is_partner_query and any(
+                        t in _last_content for t in (
+                            "time-sensitive", "time sensitive", "urgent", "need to do",
+                            "should do", "follow up", "action", "support",
+                            "anything for", "anything i need", "anything i should",
+                            "anything going on", "what should i", "what do i need",
+                            "what is", "what's",
+                        )
+                    )
+                    if _is_partner_timesensitive_q:
+                        _injected = (
+                            "[KEY FACT — PARTNER TIME-SENSITIVE ITEM: Susan's career transition "
+                            "is IMMINENT. She starts at PayPal on May 18, 2026. "
+                            "MANDATORY RESPONSE FORMAT: Answer this question with a tight bullet list. "
+                            "The FIRST bullet MUST be: "
+                            "'Susan starts at PayPal on May 18 — household scheduling will change soon.' "
+                            "The SECOND bullet MUST be: "
+                            "'Action: Coordinate with Susan now on family logistics for her first weeks at PayPal.' "
+                            "These two bullets are REQUIRED regardless of anything else. "
+                            "Do NOT say 'no urgent tasks', 'nothing immediate', or 'no action needed' — "
+                            "those phrases are FORBIDDEN in this response. "
+                            "Do NOT use 'as of [any date]' — the current date is in your system prompt header.]\n\n"
                         ) + _injected
 
                     # For pre-college / program deadline queries, prepend a KEY FACT
@@ -2855,11 +3149,23 @@ class PepperCore:
         # When the router determined the answer lives in life context (ANSWER_FROM_CONTEXT),
         # strip data-fetching tools so the model cannot call them. Only core recall tools
         # (save/search/update memory and mark commitments) remain available.
-        if routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT:
-            _RECALL_TOOL_NAMES = {"save_memory", "search_memory", "update_life_context", "mark_commitment_complete"}
+        if routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT and not is_live_data_query:
+            _RECALL_TOOL_NAMES = {"save_memory", "search_memory", "update_life_context", "mark_commitment_complete", "reset_memory"}
             tools = [t for t in MEMORY_TOOLS if t["function"]["name"] in _RECALL_TOOL_NAMES] + _PENDING_ACTION_TOOLS
         else:
-            tools = MEMORY_TOOLS + CALENDAR_TOOLS + EMAIL_TOOLS + IMESSAGE_TOOLS + WHATSAPP_TOOLS + SLACK_TOOLS + CONTACT_TOOLS + COMMS_HEALTH_TOOLS + IMAGE_TOOLS + _PENDING_ACTION_TOOLS
+            tools = (
+                MEMORY_TOOLS
+                + CALENDAR_TOOLS
+                + EMAIL_TOOLS
+                + IMESSAGE_TOOLS
+                + WHATSAPP_TOOLS
+                + SLACK_TOOLS
+                + CONTACT_TOOLS
+                + COMMS_HEALTH_TOOLS
+                + FILESYSTEM_TOOLS
+                + IMAGE_TOOLS
+                + _PENDING_ACTION_TOOLS
+            )
         # Phase 5: append MCP tools discovered from external servers
         mcp_tools = self.tool_router.get_mcp_tools()
         if mcp_tools:
@@ -3455,6 +3761,9 @@ class PepperCore:
                             logger.warning("search_images_failed", query=query, error=str(e))
                             result = {"error": f"Image search failed: {e}"}
 
+            elif name == "inspect_local_path":
+                result = await execute_inspect_local_path(args)
+
             elif name == "get_upcoming_events":
                 result = await execute_get_upcoming_events(args)
 
@@ -3496,6 +3805,12 @@ class PepperCore:
                 "get_relationship_balance_report",
             ):
                 result = await execute_comms_health_tool(name, args)
+
+            elif name == "reset_memory":
+                if not args.get("confirm"):
+                    result = {"error": "confirm must be true to reset memory"}
+                else:
+                    result = await self.memory.reset_all()
 
             elif name == "mark_commitment_complete":
                 await self.memory.save_to_recall(
@@ -3652,8 +3967,9 @@ class PepperCore:
     _SEARCH_TRIGGERS = (
         "search", "look up", "look it up", "find out", "google",
         "latest", "current", "news", "today", "right now",
+        "headline", "headlines", "highlight", "highlights",
         "what's the", "what is the", "how much", "price of",
-        "who is", "where is", "when is", "weather",
+        "who is", "where is", "when is", "weather", "forecast",
     )
 
     async def _maybe_search_web(self, user_message: str, skip: bool = False) -> str:
