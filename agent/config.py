@@ -11,6 +11,12 @@ class Settings(BaseSettings):
     # Database
     POSTGRES_URL: str = "postgresql+asyncpg://pepper:pepper@localhost:5432/pepper"
 
+    # Epic 01 (#24): /traces endpoint surfaces RAW_PERSONAL trace contents.
+    # Default-true bind keeps the endpoint reachable only over loopback.
+    # Setting this to false REQUIRES wiring session-level auth before
+    # any non-localhost client can hit /traces. See docs/GUARDRAILS.md.
+    PEPPER_BIND_LOCALHOST_ONLY: bool = True
+
     # LLM — Anthropic
     ANTHROPIC_API_KEY: Optional[str] = None
 

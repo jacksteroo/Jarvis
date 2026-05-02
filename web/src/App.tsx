@@ -4,9 +4,10 @@ import Chat from './components/Chat'
 import Status from './components/Status'
 import LifeContext from './components/LifeContext'
 import Relationships from './components/Relationships'
+import Traces from './components/Traces'
 import { logInfo } from './logger'
 
-type Tab = 'chat' | 'status' | 'context' | 'relationships'
+type Tab = 'chat' | 'status' | 'context' | 'relationships' | 'traces'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('chat')
@@ -29,6 +30,7 @@ export default function App() {
       {tab === 'status' && <Status />}
       {tab === 'context' && <LifeContext />}
       {tab === 'relationships' && <Relationships />}
+      {tab === 'traces' && <Traces />}
     </Layout>
   )
 }
