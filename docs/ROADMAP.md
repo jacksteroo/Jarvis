@@ -21,6 +21,8 @@ Pepper tells us what to build next. As the system is used, gaps become apparent.
 
 Deferred capability work (knowledge layer, health & finance, maintenance & security, advanced time-layer features) moved to [WISHLIST.md](WISHLIST.md). It will come back as actual usage surfaces needs.
 
+The **People subsystem** is also deferred. The criteria for un-deferring it — both the concrete usage signals that would justify building it and the out-of-scope signals that should not — are captured in [people-subsystem-criteria.md](people-subsystem-criteria.md). That document is the canonical answer to "should we build People?" so the question does not get re-litigated each quarter.
+
 **Next platform direction**: a notarized macOS desktop app that wraps the existing React UI in a Swift shell, embeds PostgreSQL + pgvector locally, and removes Docker from the end-user experience. See [MACOS_DESKTOP_APP_PLAN.md](MACOS_DESKTOP_APP_PLAN.md).
 
 **Near-term auth/platform work**: formalize credential lifecycle behavior across Docker today and the macOS app later:
