@@ -99,6 +99,16 @@ class PepperScheduler:
             id="reflector_trigger",
             replace_existing=True,
         )
+        # Epic 01 (#21): nightly trace compression. Promotes
+        # working → recall (>24h) and recall → archival (>28d).
+        # Lives here, NOT inside the reflector — separation of concerns.
+        # Idempotent so a re-run after partial failure is safe.
+        self._scheduler.add_job(
+            self.run_trace_compression,
+            CronTrigger(hour=2, minute=15),
+            id="trace_compression",
+            replace_existing=True,
+        )
         self._scheduler.start()
         logger.info("scheduler_started", jobs=[j.id for j in self._scheduler.get_jobs()])
 
@@ -270,6 +280,41 @@ class PepperScheduler:
         await self._audit("commitment_followup", f"{len(due)} items")
         logger.info("commitment_followup_sent", count=len(due))
         return message
+
+    async def run_trace_compression(self) -> dict:
+        """Nightly trace compression (#21).
+
+        Idempotent: re-running on the same day produces identical
+        results because each tier scan filter excludes already-promoted
+        rows.
+        """
+        if self.pepper.db_factory is None:
+            logger.info("trace_compression_skipped", reason="no_db_factory")
+            return {"ok": False, "reason": "no_db_factory"}
+        try:
+            from agent.traces.compression import run_nightly_compression
+
+            result = await run_nightly_compression(self.pepper.db_factory)
+            await self._audit(
+                "trace_compression",
+                f"recall={result['recall'].advanced_to_recall} "
+                f"archival={result['archival'].advanced_to_archival}",
+            )
+            return {
+                "ok": True,
+                "recall_advanced": result["recall"].advanced_to_recall,
+                "archival_advanced": result["archival"].advanced_to_archival,
+                "errors": (
+                    result["recall"].errors + result["archival"].errors
+                ),
+            }
+        except Exception as exc:
+            logger.warning(
+                "trace_compression_failed",
+                error_type=type(exc).__name__,
+                error=str(exc)[:200],
+            )
+            return {"ok": False, "error": type(exc).__name__}
 
     async def fire_reflector_trigger(self) -> bool:
         """Fire the end-of-day Postgres NOTIFY for the reflector (#39).
