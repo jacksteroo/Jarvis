@@ -1,5 +1,13 @@
 # Pepper — Build Roadmap
 
+## Architectural decisions driving the current sequence
+
+The current sequencing of this roadmap is set by ratified ADRs. When the sequencing changes, a new ADR records why and this section is updated.
+
+- [ADR-0001](adr/0001-resequence-around-oj-calibration.md) — pause original Phases 4–6 (Knowledge / Health / Finance); sequence as substrate → inner life → subsystem expansion.
+
+See [docs/adr/](adr/) for the full list.
+
 ## Philosophy
 
 Build the orchestrator first. Subsystems plug in over time. Each phase must be genuinely useful before the next begins — no building ahead of real need.
