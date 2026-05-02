@@ -1,0 +1,568 @@
+"""Phase 3 post-cutover kill-switch.
+
+Wraps the read-only ``router_soak_monitor`` with side-effecting actions
+the migration plan requires:
+
+- **Telegram alert** on any soak FAIL or ROLLBACK status (Phase 3 spec:
+  "Telegram ping on any check fail").
+- **Auto-rollback** on ROLLBACK status (eval pass-rate < 80%): writes a
+  rollback plan to ``logs/router_audit/rollback_<ts>/`` and, when armed
+  with the correct confirm token, executes ``git checkout`` of the pre-
+  cutover sha + ``docker compose up -d --build`` to restore the legacy
+  router (Phase 3 spec: "Auto-rollback (docker rebuild from archive) if
+  eval drops below 80%").
+
+The rollback executor is opt-in (``ROUTER_KILL_SWITCH_CONFIRM`` env or
+explicit CLI flag). Default behaviour is plan-only — write the diagnosis
+plus a runnable bash script the operator can inspect, then trigger the
+Telegram alert pointing at it. This satisfies Hard Rule 1 ("Never delete
+data; backups before destructive ops") even while wiring an action that
+the spec says is automatic: the snapshot at ``backups/router/
+phase_3_pre_cutover_*/`` is the backup, and the plan file is the audit
+trail for what would or did run.
+
+Privacy: this module never reads or transmits raw query text. The
+Telegram alert reports check names + numeric values + the soak result
+file path (a local file). Eval set queries used by the soak p95 probe
+are synthetic.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import subprocess
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import structlog
+
+from agent.router_soak_monitor import REPO_ROOT, SoakResult
+
+logger = structlog.get_logger(__name__)
+
+# Pre-cutover commit (cutover landed in cd8cf23 — its parent is the last
+# QueryRouter-primary state). Read-only constant; if a future cutover
+# re-points this, update both here and the migration plan.
+PRE_CUTOVER_SHA = "af86069"
+DEFAULT_SNAPSHOT_GLOB = "backups/router/phase_3_pre_cutover_*"
+ROLLBACK_DIR = REPO_ROOT / "logs" / "router_audit"
+CONFIRM_TOKEN_ENV = "ROUTER_KILL_SWITCH_CONFIRM"
+EXPECTED_CONFIRM_TOKEN = "I-UNDERSTAND-DOCKER-REBUILD"
+
+
+@dataclass
+class RollbackPlan:
+    """Concrete steps the kill-switch would (or did) run.
+
+    The plan is always written to disk before any subprocess fires, so
+    a half-executed rollback leaves an audit trail behind.
+    """
+
+    soak_result_path: Optional[str]
+    pre_cutover_sha: str
+    snapshot_path: Optional[str]
+    commands: list[list[str]]
+    plan_dir: str
+    generated_at: str
+    executed: bool = False
+    execution_log: list[dict] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+# ─── Plan / snapshot resolution ──────────────────────────────────────────
+
+
+def _latest_snapshot(repo_root: Path = REPO_ROOT) -> Optional[Path]:
+    matches = sorted(repo_root.glob(DEFAULT_SNAPSHOT_GLOB))
+    return matches[-1] if matches else None
+
+
+def plan_rollback(
+    result: SoakResult,
+    *,
+    repo_root: Path = REPO_ROOT,
+    pre_cutover_sha: str = PRE_CUTOVER_SHA,
+    soak_result_path: Optional[str] = None,
+) -> RollbackPlan:
+    """Compose the rollback plan without executing it.
+
+    Always includes a ``git checkout`` of the pre-cutover sha into a
+    rollback branch (so HEAD before rollback isn't lost), followed by a
+    ``docker compose up -d --build`` to rebuild the agent against the
+    legacy primary router. If a pre-cutover snapshot dir exists under
+    ``backups/router/``, the path is recorded for the operator's
+    reference (DB state did not change at cutover, so no DB restore is
+    in the auto-plan; the snapshot is a hand-recoverable safety net).
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    plan_dir = ROLLBACK_DIR / f"rollback_{ts}"
+    rollback_branch = f"router-rollback-{ts}"
+
+    snapshot = _latest_snapshot(repo_root)
+    snapshot_path = str(snapshot) if snapshot else None
+
+    commands: list[list[str]] = [
+        ["git", "checkout", "-b", rollback_branch, pre_cutover_sha],
+        ["docker", "compose", "up", "-d", "--build"],
+    ]
+
+    return RollbackPlan(
+        soak_result_path=soak_result_path,
+        pre_cutover_sha=pre_cutover_sha,
+        snapshot_path=snapshot_path,
+        commands=commands,
+        plan_dir=str(plan_dir),
+        generated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def write_plan(plan: RollbackPlan) -> Path:
+    """Persist the plan + a runnable bash mirror under plan_dir."""
+    pdir = Path(plan.plan_dir)
+    pdir.mkdir(parents=True, exist_ok=True)
+    plan_path = pdir / "plan.json"
+    plan_path.write_text(json.dumps(plan.as_dict(), indent=2, sort_keys=True))
+
+    script = pdir / "rollback.sh"
+    lines = [
+        "#!/usr/bin/env bash",
+        "# Auto-generated by agent.router_kill_switch.write_plan",
+        "# Inspect carefully before running. This rebuilds the docker stack.",
+        "set -euo pipefail",
+        f"cd {REPO_ROOT}",
+    ]
+    for cmd in plan.commands:
+        lines.append(" ".join(_shellquote(a) for a in cmd))
+    script.write_text("\n".join(lines) + "\n")
+    script.chmod(0o755)
+    return plan_path
+
+
+def _shellquote(arg: str) -> str:
+    if not arg or any(c in arg for c in " \t\"'\\$`"):
+        return "'" + arg.replace("'", "'\\''") + "'"
+    return arg
+
+
+# ─── Execution (gated) ───────────────────────────────────────────────────
+
+
+def execute_rollback(
+    plan: RollbackPlan,
+    *,
+    confirm_token: Optional[str] = None,
+    runner=subprocess.run,
+) -> RollbackPlan:
+    """Run the plan's commands sequentially.
+
+    Refuses unless ``confirm_token == EXPECTED_CONFIRM_TOKEN`` (the env
+    var ``ROUTER_KILL_SWITCH_CONFIRM`` is also accepted as fallback).
+    Stops on the first non-zero exit. The plan is updated in place with
+    ``executed=True`` and a per-command log entry, then re-written to
+    disk so the audit trail reflects what actually ran.
+
+    ``runner`` is injected for tests (defaults to subprocess.run).
+    """
+    token = confirm_token or os.environ.get(CONFIRM_TOKEN_ENV, "")
+    if token != EXPECTED_CONFIRM_TOKEN:
+        raise PermissionError(
+            "execute_rollback refused: confirm_token must equal "
+            f"'{EXPECTED_CONFIRM_TOKEN}' (pass via arg or "
+            f"{CONFIRM_TOKEN_ENV} env var). This guard exists because the "
+            "plan rebuilds the docker stack — verify intent before arming."
+        )
+
+    pdir = Path(plan.plan_dir)
+    pdir.mkdir(parents=True, exist_ok=True)
+    plan.executed = True
+    for cmd in plan.commands:
+        logger.info("router_kill_switch_running", cmd=cmd)
+        proc = runner(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+        entry = {
+            "cmd": cmd,
+            "returncode": getattr(proc, "returncode", None),
+            "stdout_tail": (getattr(proc, "stdout", "") or "")[-2000:],
+            "stderr_tail": (getattr(proc, "stderr", "") or "")[-2000:],
+        }
+        plan.execution_log.append(entry)
+        if entry["returncode"] != 0:
+            (pdir / "plan.json").write_text(
+                json.dumps(plan.as_dict(), indent=2, sort_keys=True)
+            )
+            raise RuntimeError(
+                f"rollback halted: {' '.join(cmd)} exited "
+                f"{entry['returncode']}"
+            )
+    (pdir / "plan.json").write_text(
+        json.dumps(plan.as_dict(), indent=2, sort_keys=True)
+    )
+    return plan
+
+
+# ─── Drill (dry-run) ─────────────────────────────────────────────────────
+
+
+DRILL_DIR_PREFIX = "drill"
+
+
+def drill_rollback(
+    *,
+    repo_root: Path = REPO_ROOT,
+    soak_result: Optional[SoakResult] = None,
+    runner=subprocess.run,
+) -> dict:
+    """Phase 3 docker-rebuild drill: generate plan + verify, never execute.
+
+    Produces an audit artifact dir ``logs/router_audit/drill_<ts>/``
+    containing the would-be ``plan.json`` and ``rollback.sh`` (same
+    artifacts a real ROLLBACK status would emit), plus a
+    ``drill_report.json`` summarising the verification steps.
+
+    Verification steps (each PASS/FAIL on the report):
+      1. ``plan_rollback`` returns a non-empty command list including
+         git checkout of ``PRE_CUTOVER_SHA`` and ``docker compose up
+         -d --build``.
+      2. ``write_plan`` materialises ``plan.json`` and an executable
+         ``rollback.sh`` on disk under the drill dir.
+      3. ``rollback.sh`` passes ``bash -n`` syntax check.
+      4. ``PRE_CUTOVER_SHA`` resolves in git (``git cat-file -e``).
+      5. The pre-cutover snapshot directory exists.
+
+    The function never runs ``git checkout`` or ``docker compose`` and
+    never sends a Telegram alert. It is the Phase 3 exit-criterion
+    audit artifact — proof the kill-switch is wired and runnable
+    without firing it.
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    drill_dir = ROLLBACK_DIR / f"{DRILL_DIR_PREFIX}_{ts}"
+    drill_dir.mkdir(parents=True, exist_ok=True)
+
+    if soak_result is None:
+        from agent.router_soak_monitor import SoakCheck
+
+        soak_result = SoakResult(
+            overall_status="ROLLBACK",
+            checks=[
+                SoakCheck(
+                    name="eval_pass_rate",
+                    status="FAIL",
+                    value=0.5,
+                    threshold=0.85,
+                    detail="synthetic drill input",
+                ),
+            ],
+            eval_pass_rate=0.5,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    steps: list[dict] = []
+
+    # Step 1: plan composition
+    plan = plan_rollback(soak_result, repo_root=repo_root)
+    plan.plan_dir = str(drill_dir)
+    cmds_ok = (
+        len(plan.commands) >= 2
+        and any("checkout" in c and PRE_CUTOVER_SHA in c for c in plan.commands)
+        and any(c[:3] == ["docker", "compose", "up"] for c in plan.commands)
+    )
+    steps.append(
+        {
+            "step": "plan_compose",
+            "status": "PASS" if cmds_ok else "FAIL",
+            "detail": f"{len(plan.commands)} cmds: {plan.commands}",
+        }
+    )
+
+    # Step 2: artifacts on disk
+    plan_path = write_plan(plan)
+    sh_path = drill_dir / "rollback.sh"
+    artifacts_ok = (
+        plan_path.exists()
+        and sh_path.exists()
+        and bool(sh_path.stat().st_mode & 0o111)
+    )
+    steps.append(
+        {
+            "step": "artifacts_written",
+            "status": "PASS" if artifacts_ok else "FAIL",
+            "detail": f"plan.json={plan_path.exists()} rollback.sh={sh_path.exists()} executable={bool(sh_path.stat().st_mode & 0o111) if sh_path.exists() else False}",
+        }
+    )
+
+    # Step 3: bash syntax check
+    proc = runner(
+        ["bash", "-n", str(sh_path)],
+        capture_output=True,
+        text=True,
+    )
+    syntax_ok = getattr(proc, "returncode", 1) == 0
+    steps.append(
+        {
+            "step": "bash_syntax_check",
+            "status": "PASS" if syntax_ok else "FAIL",
+            "detail": (getattr(proc, "stderr", "") or "")[:500] or "bash -n exit 0",
+        }
+    )
+
+    # Step 4: pre-cutover sha exists
+    sha_proc = runner(
+        ["git", "-C", str(repo_root), "cat-file", "-e", PRE_CUTOVER_SHA],
+        capture_output=True,
+        text=True,
+    )
+    sha_ok = getattr(sha_proc, "returncode", 1) == 0
+    steps.append(
+        {
+            "step": "pre_cutover_sha_exists",
+            "status": "PASS" if sha_ok else "FAIL",
+            "detail": f"sha={PRE_CUTOVER_SHA} rc={getattr(sha_proc, 'returncode', None)}",
+        }
+    )
+
+    # Step 5: snapshot dir exists
+    snapshot = _latest_snapshot(repo_root)
+    snap_ok = snapshot is not None and snapshot.is_dir()
+    steps.append(
+        {
+            "step": "snapshot_dir_exists",
+            "status": "PASS" if snap_ok else "FAIL",
+            "detail": str(snapshot) if snapshot else "no match for "
+            + DEFAULT_SNAPSHOT_GLOB,
+        }
+    )
+
+    overall = "PASS" if all(s["status"] == "PASS" for s in steps) else "FAIL"
+    report = {
+        "overall_status": overall,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "drill_dir": str(drill_dir),
+        "pre_cutover_sha": PRE_CUTOVER_SHA,
+        "snapshot_path": plan.snapshot_path,
+        "commands": plan.commands,
+        "steps": steps,
+        "executed": False,
+        "telegram_sent": False,
+    }
+    (drill_dir / "drill_report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True)
+    )
+    logger.info(
+        "router_kill_switch_drill",
+        overall=overall,
+        drill_dir=str(drill_dir),
+    )
+    return report
+
+
+# ─── Telegram alert ──────────────────────────────────────────────────────
+
+
+def format_alert(
+    result: SoakResult,
+    *,
+    soak_result_path: Optional[str] = None,
+    plan: Optional[RollbackPlan] = None,
+) -> str:
+    """Compose the Telegram alert body.
+
+    Numeric-only — never prints query text or any field that could
+    transit user data. Compact enough to render inside one Telegram
+    message bubble (no chunking required for a single window).
+    """
+    lines: list[str] = []
+    icon = {"ROLLBACK": "🛑", "FAIL": "⚠️", "PASS": "✅"}.get(
+        result.overall_status, "❓"
+    )
+    lines.append(
+        f"{icon} Router soak monitor: {result.overall_status}"
+    )
+    if result.eval_pass_rate is not None:
+        lines.append(f"eval_pass_rate={result.eval_pass_rate:.3f}")
+    for c in result.checks:
+        lines.append(
+            f"  {c.status:<8} {c.name}={c.value} (threshold={c.threshold})"
+        )
+    if soak_result_path:
+        lines.append(f"result: {soak_result_path}")
+    if plan is not None:
+        lines.append(f"rollback_plan: {plan.plan_dir}")
+        if plan.executed:
+            lines.append("rollback EXECUTED — verify container health")
+        else:
+            lines.append(
+                "rollback NOT executed (arm with ROUTER_KILL_SWITCH_CONFIRM "
+                "+ --auto-rollback to run plan)"
+            )
+    return "\n".join(lines)
+
+
+async def send_alert(message: str) -> bool:
+    """Push ``message`` to the configured Telegram allowed users.
+
+    Returns False if no token / no recipients (logs a warning so the
+    operator notices a misconfigured kill-switch). Mirrors the one-shot
+    push pattern used by ``agent.router_adjudication``.
+    """
+    from agent.config import settings as live_settings
+    from agent.telegram_bot import JARViSTelegramBot
+
+    token = live_settings.TELEGRAM_BOT_TOKEN
+    if not token:
+        logger.warning(
+            "router_kill_switch_send_skipped",
+            reason="TELEGRAM_BOT_TOKEN unset",
+        )
+        return False
+    bot = JARViSTelegramBot(
+        token=token, pepper_core=None, config=live_settings
+    )
+    from telegram import Bot
+
+    bot._bot = Bot(token=token)
+    try:
+        await bot.send_message(message, parse_mode=None)
+    except Exception as exc:  # noqa: BLE001 — log and surface
+        logger.error("router_kill_switch_send_failed", error=str(exc))
+        return False
+    return True
+
+
+# ─── Top-level orchestration ─────────────────────────────────────────────
+
+
+async def handle_soak_result(
+    result: SoakResult,
+    *,
+    soak_result_path: Optional[str] = None,
+    auto_rollback: bool = False,
+    confirm_token: Optional[str] = None,
+    notify: bool = True,
+) -> dict:
+    """Dispatch alerts + (optionally) rollback based on overall_status.
+
+    PASS → return early, no alert fired.
+    FAIL → write no plan, send Telegram alert.
+    ROLLBACK → write plan; if auto_rollback + confirm token, execute it;
+               always send Telegram alert pointing at the plan dir.
+    """
+    out: dict = {"alert_sent": False, "plan": None, "executed": False}
+    status = result.overall_status
+
+    if status == "PASS":
+        return out
+
+    plan: Optional[RollbackPlan] = None
+    if status == "ROLLBACK":
+        plan = plan_rollback(result, soak_result_path=soak_result_path)
+        write_plan(plan)
+        out["plan"] = plan.as_dict()
+        if auto_rollback:
+            try:
+                execute_rollback(plan, confirm_token=confirm_token)
+                out["executed"] = True
+            except PermissionError as exc:
+                logger.warning(
+                    "router_kill_switch_unarmed", error=str(exc)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "router_kill_switch_execute_failed", error=str(exc)
+                )
+
+    if notify:
+        msg = format_alert(
+            result, soak_result_path=soak_result_path, plan=plan
+        )
+        out["alert_sent"] = await send_alert(msg)
+    return out
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="router_kill_switch",
+        description=(
+            "Phase 3 kill-switch: read a soak result JSON and dispatch "
+            "Telegram alert + rollback plan / execution as the status "
+            "warrants."
+        ),
+    )
+    p.add_argument(
+        "--soak-result",
+        help="Path to a soak result JSON (output of router_soak_monitor check)",
+    )
+    p.add_argument(
+        "--drill",
+        action="store_true",
+        help=(
+            "Phase 3 dry-run drill: generate rollback plan + verify "
+            "artifacts/script syntax/sha/snapshot, never execute. Writes "
+            "logs/router_audit/drill_<ts>/drill_report.json. No Telegram."
+        ),
+    )
+    p.add_argument(
+        "--auto-rollback",
+        action="store_true",
+        help=(
+            "Execute the rollback plan when status==ROLLBACK. Requires "
+            f"{CONFIRM_TOKEN_ENV}={EXPECTED_CONFIRM_TOKEN}. Default off."
+        ),
+    )
+    p.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="Skip Telegram alert (plan-only mode for testing).",
+    )
+    return p
+
+
+async def _cli(args: argparse.Namespace) -> int:
+    if args.drill:
+        report = drill_rollback()
+        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return 0 if report["overall_status"] == "PASS" else 1
+    if not args.soak_result:
+        raise SystemExit(
+            "either --soak-result PATH or --drill is required"
+        )
+    payload = json.loads(Path(args.soak_result).read_text())
+    # Reconstruct the minimal SoakResult fields format_alert / handle need.
+    from agent.router_soak_monitor import SoakCheck
+
+    result = SoakResult(
+        overall_status=payload.get("overall_status", "PASS"),
+        checks=[SoakCheck(**c) for c in payload.get("checks", [])],
+        eval_pass_rate=payload.get("eval_pass_rate"),
+        baseline_path=payload.get("baseline_path"),
+        generated_at=payload.get("generated_at", ""),
+    )
+    out = await handle_soak_result(
+        result,
+        soak_result_path=args.soak_result,
+        auto_rollback=args.auto_rollback,
+        notify=not args.no_notify,
+    )
+    print(json.dumps(out, indent=2, sort_keys=True, default=str))
+    if result.overall_status == "ROLLBACK":
+        return 4
+    if result.overall_status == "FAIL":
+        return 1
+    return 0
+
+
+def main() -> int:
+    args = _build_parser().parse_args()
+    return asyncio.run(_cli(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

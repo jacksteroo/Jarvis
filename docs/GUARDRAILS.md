@@ -25,7 +25,8 @@ Pepper must operate under similar principles: **the harness makes the agent reli
 
 **Applied to Pepper:**
 
-- Life context in `docs/LIFE_CONTEXT.md` (version controlled)
+- Life context template in `docs/LIFE_CONTEXT.md.example` (version controlled)
+- Live life context in `data/life_context.md` (gitignored, mutable — Pepper writes back via `update_life_context`; every change is also persisted as a `LifeContextVersion` row in Postgres for history)
 - Roadmap in `docs/ROADMAP.md` (version controlled)
 - Architecture in `docs/ARCHITECTURE.md` (version controlled)
 - Architectural decisions in [`docs/adr/`](adr/) (version controlled)

@@ -34,7 +34,7 @@ maintenance/    # Self-upgrade and health check agents
 - **Architectural decisions**: [docs/adr/](docs/adr/) — canonical home for architectural decision records (ADRs). Any decision that survives a Notion thread becomes an ADR before the implementation PR opens.
 - Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md)
-- Life Context: [docs/LIFE_CONTEXT.md](docs/LIFE_CONTEXT.md) — this is Pepper's ground truth about its owner
+- Life Context: [data/life_context.md](data/life_context.md) — Pepper's ground truth about its owner. Mutable, gitignored, written back to by `update_life_context`. Template at [docs/LIFE_CONTEXT.md.example](docs/LIFE_CONTEXT.md.example).
 - LLM Strategy: [docs/LLM_STRATEGY.md](docs/LLM_STRATEGY.md)
 - Agent Infrastructure: [docs/INFRA_GUIDELINES.md](docs/INFRA_GUIDELINES.md) — tool registry, memory pipeline, autonomy ladder, eval flywheel
 
@@ -48,7 +48,7 @@ Pepper follows **harness engineering** principles from OpenAI: the system around
 
 - Raw personal data (emails, messages, health, finance) NEVER leaves the machine
 - Claude API receives **summaries only**, never raw content
-- All embeddings generated locally (Ollama + nomic-embed-text)
+- All embeddings generated locally via Ollama: router uses `qwen3-embedding:0.6b` (1024-dim); memory subsystem uses `nomic-embed-text` (768-dim)
 - PostgreSQL runs locally, never cloud-hosted
 - **Before any external API call with personal data: ask yourself "is this a summary or raw content?"**
 

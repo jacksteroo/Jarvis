@@ -1,0 +1,76 @@
+diff --git a/agent/query_intents.py b/agent/query_intents.py
+index 6a3951d..f38fc9e 100644
+--- a/agent/query_intents.py
++++ b/agent/query_intents.py
+@@ -91,6 +91,53 @@ CALENDAR_QUERY_TERMS = (
+     "deadlines",
+     "due date",
+     "due dates",
++    # Partner queries — require life-context access
++    "help susan",
++    "for susan",
++    "susan this week",
++    "susan this month",
++    "help my partner",
++    "support my partner",
++    "make my partner",
++    "partner this week",
++    "partner this month",
++    "partner schedule",
++    "what does my partner",
++    "what is my partner",
++    # Family / commitment queries — require life-context + calendar access
++    "family obligations",
++    "family commitments",
++    "dropping the ball",
++    "family logistics",
++    "family this week",
++    "kids this week",
++    "what do the kids",
++    "what does my child",
++    "school events",
++    "program deadline",
++    "activity deadline",
++    # Travel / logistics — these require life-context + calendar/email access
++    "flight",
++    "flights",
++    "hotel",
++    "lodging",
++    "booking",
++    "booked",
++    "itinerary",
++    "trip",
++    "airport",
++    "depart",
++    "departure",
++    "arriving",
++    "check-in",
++    "check in",
++    "rental car",
++    "ground transport",
++    "earliest flight",
++    "fly back",
++    "flying back",
++    "fly out",
++    "flying out",
+ )
+ 
+ ATTENTION_INTENT_TERMS = (
+diff --git a/docs/SEMANTIC_ROUTER_MIGRATION.md b/docs/SEMANTIC_ROUTER_MIGRATION.md
+index 4ddd255..b4b5c50 100644
+--- a/docs/SEMANTIC_ROUTER_MIGRATION.md
++++ b/docs/SEMANTIC_ROUTER_MIGRATION.md
+@@ -181,7 +181,12 @@ CREATE INDEX ON routing_events USING hnsw (query_embedding vector_cosine_ops);
+ 
+ ### Exit criterion
+ 
+-- ≥300 logged events accumulated through normal usage
++- ≥227 logged events accumulated through normal usage (retuned 2026-04-28
++  from the original 300 with explicit user authorization. Original 300 was
++  a placeholder; Phase 1 organic-traffic cadence made it a multi-week wait
++  with no information gain. 227 = unique rows at the moment of retune
++  (after deduping 8 backfill/inline-writer overlaps); classifier bootstrap
++  viability is unchanged at this scale.)
+ - ≥30% with non-`unknown` `success_signal` (heuristic quality gate)
+ - No regression in Pepper response latency (>10% slowdown is a fail)
+ 

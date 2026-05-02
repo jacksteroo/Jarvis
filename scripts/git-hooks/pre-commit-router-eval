@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Pre-commit hook: gate router changes on the canonical eval set (Phase 3+).
+#
+# Runs only when staged files touch router code, the eval set, or seeds.
+# Invokes `.venv/bin/python -m agent.router_eval --threshold 0.85` and
+# blocks the commit if the pass rate drops below 85%.
+#
+# Bypass (use sparingly): SKIP_ROUTER_EVAL=1 git commit ...
+#
+# Install:
+#   ln -sf ../../scripts/git-hooks/pre-commit-router-eval .git/hooks/pre-commit
+# (or chain into an existing pre-commit dispatcher)
+
+set -euo pipefail
+
+if [[ "${SKIP_ROUTER_EVAL:-0}" == "1" ]]; then
+  echo "pre-commit-router-eval: SKIP_ROUTER_EVAL=1, skipping"
+  exit 0
+fi
+
+ROUTER_PATTERNS=(
+  '^agent/semantic_router\.py$'
+  '^agent/query_router\.py$'
+  '^agent/router_eval\.py$'
+  '^agent/router_exemplar_seeds\.py$'
+  '^agent/router_shadow_replay\.py$'
+  '^agent/router_adjudication\.py$'
+  '^agent/router_latency_bench\.py$'
+  '^tests/router_eval_set\.jsonl$'
+  '^tests/router_.*\.jsonl$'
+  '^agent/tests/test_router_.*\.py$'
+  '^agent/tests/test_semantic_router\.py$'
+)
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+if [[ -z "$staged" ]]; then
+  exit 0
+fi
+
+touched=0
+while IFS= read -r f; do
+  for pat in "${ROUTER_PATTERNS[@]}"; do
+    if [[ "$f" =~ $pat ]]; then
+      touched=1
+      break
+    fi
+  done
+  [[ $touched -eq 1 ]] && break
+done <<< "$staged"
+
+if [[ $touched -eq 0 ]]; then
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PY="${REPO_ROOT}/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  echo "pre-commit-router-eval: ${PY} not found; install the project venv (see README)" >&2
+  exit 1
+fi
+
+echo "pre-commit-router-eval: router files staged, running canonical eval (threshold 0.85)…"
+cd "$REPO_ROOT"
+if ! "$PY" -m agent.router_eval --threshold 0.85; then
+  echo "" >&2
+  echo "pre-commit-router-eval: canonical eval FAILED (<85% pass rate)" >&2
+  echo "  - inspect the JSON output above for the miss list" >&2
+  echo "  - bypass (only with cause): SKIP_ROUTER_EVAL=1 git commit ..." >&2
+  exit 1
+fi
+
+echo "pre-commit-router-eval: canonical eval PASSED"
+exit 0

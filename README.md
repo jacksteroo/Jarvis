@@ -75,10 +75,12 @@ cd web && npm run dev
 Before Pepper is useful, you need to fill in your Life Context document. This is Pepper's ground truth about you — your family, responsibilities, goals, patterns, and what matters. The quality of everything Pepper does is directly proportional to the honesty and specificity of this document.
 
 ```bash
-cp docs/LIFE_CONTEXT.md.example docs/LIFE_CONTEXT.md
+cp docs/LIFE_CONTEXT.md.example data/life_context.md
 ```
 
-Then open `docs/LIFE_CONTEXT.md` and fill it in. [`LIFE_CONTEXT.md.example`](docs/LIFE_CONTEXT.md.example) has a fully annotated template with guidance for every section:
+Then open `data/life_context.md` and fill it in. [`docs/LIFE_CONTEXT.md.example`](docs/LIFE_CONTEXT.md.example) has a fully annotated template with guidance for every section:
+
+> The file lives under `data/` (user-mutable state), not `docs/` (project documentation). Pepper writes back to it when you ask it to update something — keep it under `data/` so the docs/ tree stays clean and read-only inside the container.
 
 | Section | What goes here |
 | --- | --- |
@@ -98,7 +100,7 @@ A few tips:
 - Write what's actually true, not what sounds good. Pepper uses this to prioritize, not to judge.
 - Be specific. "Work is busy" is useless. "Need to ship v1 by June or the funding round is at risk" is useful.
 - Keep it current. Pepper is only as accurate as this document. Update it when things change.
-- `docs/LIFE_CONTEXT.md` is gitignored — it stays on your machine and is never committed.
+- `data/life_context.md` is gitignored — it stays on your machine and is never committed.
 
 ---
 
@@ -128,10 +130,17 @@ Telegram / Web UI / API
     ├── Life Context Document (your ground truth)
     ├── Persistent Memory (pgvector — working / recall / archival)
     ├── Proactive Scheduler (APScheduler — brief, review, commitments)
+    ├── Semantic Intent Router (k-NN over exemplar embeddings; pgvector HNSW)
     └── Tool Router → Subsystems (MCP/REST)
               ↓
     PostgreSQL + pgvector (local)
 ```
+
+The intent router is semantic since the Phase 3 cutover (2026-04-29):
+top-level intent is classified by k-NN over per-intent exemplar embeddings
+(`qwen3-embedding:0.6b`), with capability filtering applied as a
+deterministic post-route step. The legacy regex router runs in shadow for
+the soak window. See [`docs/SEMANTIC_ROUTER.md`](docs/SEMANTIC_ROUTER.md).
 
 Two LLM tiers:
 

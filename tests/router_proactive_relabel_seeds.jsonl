@@ -1,0 +1,13 @@
+{"query": "What's the most important thing on my plate today?", "pattern_id": "proactive-daily-brief", "notes": "Daily-brief synthesis across sources; mirror of proactive-01 phrasing.", "intent_label": "cross_source_triage"}
+{"query": "Run me through everything I need to handle today", "pattern_id": "proactive-daily-brief", "notes": "Daily roll-up; proactive-04 sibling.", "intent_label": "cross_source_triage"}
+{"query": "Pull together where I stand right now", "pattern_id": "proactive-status-rollup", "notes": "Status synthesis across sources.", "intent_label": "cross_source_triage"}
+{"query": "What's overdue across all my conversations and tasks?", "pattern_id": "proactive-overdue-sweep", "notes": "Overdue scan, multi-source.", "intent_label": "cross_source_triage"}
+{"query": "Round up anything that needs my attention this week", "pattern_id": "proactive-weekly-rollup", "notes": "Weekly attention sweep.", "intent_label": "cross_source_triage"}
+{"query": "Give me a roll-up of what's actively in motion", "pattern_id": "proactive-status-rollup", "notes": "Active-work synthesis.", "intent_label": "cross_source_triage"}
+{"query": "What requires action across all my channels?", "pattern_id": "proactive-multi-source-scan", "notes": "Action-required multi-channel scan.", "intent_label": "cross_source_triage"}
+{"query": "Help me see the bigger picture across my obligations", "pattern_id": "proactive-status-rollup", "notes": "High-level synthesis.", "intent_label": "cross_source_triage"}
+{"query": "Compile everything pending into one view", "pattern_id": "proactive-status-rollup", "notes": "Pending-work synthesis.", "intent_label": "cross_source_triage"}
+{"query": "Show me upcoming due dates I committed to", "pattern_id": "action-deadlines", "notes": "Deadline scan; proactive-06 sibling.", "intent_label": "action_items"}
+{"query": "Which deliverables have I committed to this week?", "pattern_id": "action-deadlines", "notes": "Weekly deliverable scan.", "intent_label": "action_items"}
+{"query": "List the items I owe people responses on", "pattern_id": "action-owed-replies", "notes": "Owed-reply scan; complements 'Anything I owe a reply to?'", "intent_label": "action_items"}
+{"query": "Are there commitments slipping at work this week?", "pattern_id": "action-deadlines", "notes": "Slipping-commitment scan; proactive-06 phrasing variant.", "intent_label": "action_items"}

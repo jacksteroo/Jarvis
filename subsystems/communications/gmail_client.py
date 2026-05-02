@@ -1,14 +1,20 @@
 """Gmail API client for Pepper.
 
-Uses the shared Google OAuth token for the account, which now authorizes both
-Gmail and Calendar read access:
+Uses the shared Google OAuth token for the account, which now authorizes
+Gmail read + send and Calendar read:
   ~/.config/pepper/google_token.json       ← personal/default account
   ~/.config/pepper/google_token_work.json  ← named account
 
-Only message headers and snippets are fetched — raw bodies never leave the machine.
+Reads: only message headers and snippets are fetched — raw bodies never leave
+the machine. Sends: only invoked by the pending-actions queue after explicit
+user approval.
 """
 
 from __future__ import annotations
+
+import base64
+from email.message import EmailMessage
+from email.utils import make_msgid
 
 from googleapiclient.discovery import build
 
@@ -114,3 +120,69 @@ class GmailClient:
             userId="me", q="is:unread in:inbox", maxResults=1
         ).execute()
         return result.get("resultSizeEstimate", 0)
+
+    def _resolve_thread_headers(self, in_reply_to_id: str) -> tuple[str | None, str | None, str | None]:
+        """Look up the original message's Message-ID + References + threadId so a
+        reply lands in the same Gmail thread. Returns (message_id_header,
+        references_header, gmail_thread_id). Any may be None if lookup fails."""
+        try:
+            full = self._get_service().users().messages().get(
+                userId="me",
+                id=in_reply_to_id,
+                format="metadata",
+                metadataHeaders=["Message-ID", "References", "Subject"],
+            ).execute()
+        except Exception:
+            return None, None, None
+        headers = {
+            h["name"].lower(): h["value"]
+            for h in full.get("payload", {}).get("headers", [])
+        }
+        msg_id = headers.get("message-id")
+        refs = headers.get("references", "") or ""
+        new_refs = (refs + " " + msg_id).strip() if msg_id else (refs or None)
+        return msg_id, new_refs, full.get("threadId")
+
+    def send_message(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        in_reply_to_id: str | None = None,
+        cc: str | None = None,
+        bcc: str | None = None,
+    ) -> dict:
+        """Send a plain-text email. Returns {'id', 'threadId'} from the Gmail API.
+
+        If in_reply_to_id is supplied, the reply is threaded via In-Reply-To /
+        References headers and the Gmail threadId.
+        """
+        service = self._get_service()
+        from_addr = self.get_profile().get("emailAddress", "")
+
+        msg = EmailMessage()
+        msg["To"] = to
+        if cc:
+            msg["Cc"] = cc
+        if bcc:
+            msg["Bcc"] = bcc
+        msg["From"] = from_addr
+        msg["Subject"] = subject
+        msg["Message-ID"] = make_msgid()
+        msg.set_content(body)
+
+        thread_id: str | None = None
+        if in_reply_to_id:
+            parent_msgid, refs, thread_id = self._resolve_thread_headers(in_reply_to_id)
+            if parent_msgid:
+                msg["In-Reply-To"] = parent_msgid
+            if refs:
+                msg["References"] = refs
+
+        raw = base64.urlsafe_b64encode(bytes(msg)).decode()
+        payload: dict = {"raw": raw}
+        if thread_id:
+            payload["threadId"] = thread_id
+
+        sent = service.users().messages().send(userId="me", body=payload).execute()
+        return {"id": sent.get("id"), "threadId": sent.get("threadId"), "from": from_addr}

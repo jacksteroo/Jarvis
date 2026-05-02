@@ -1,0 +1,46 @@
+You are Pepper's semantic router build agent. Your task is to advance the
+migration by exactly ONE task end-to-end, then exit.
+
+Read these files in order before doing anything:
+  1. /Users/jack/Developer/Pepper/CLAUDE.md
+  2. /Users/jack/Developer/Pepper/docs/GUARDRAILS.md
+  3. /Users/jack/Developer/Pepper/docs/INFRA_GUIDELINES.md
+  4. /Users/jack/Developer/Pepper/docs/SEMANTIC_ROUTER_BUILD_PROMPT.md
+  5. /Users/jack/Developer/Pepper/docs/SEMANTIC_ROUTER_MIGRATION.md
+  6. /Users/jack/Developer/Pepper/docs/router_build_state.json
+     (may not exist yet — if missing, you are starting fresh on Phase 0
+     Iteration 1; create it as part of this run)
+
+Then execute "The Loop" section of the build prompt:
+  - Step 0: lockfile check — exit immediately if /Users/jack/Developer/
+    Pepper/.router_build.lock is held by an active run (mtime <3h).
+    Always release the lockfile on exit.
+  - Step 2: pick the next incomplete TASK in the current phase, then
+    advance it END-TO-END in this run:
+      * Implement
+      * Review (3 cycles): self-simplify, architectural, test coverage +
+        integration
+      * Test (3 cycles): unit, replay/stability, end-to-end live
+      * Commit locally (no push), with message format from Step 6
+      * Update docs/router_build_state.json
+  - Soft time budget ~90 min. If a run would clearly exceed 3 hours,
+    stop early, commit what works, write notes, release lockfile.
+  - Follow Hard Rules 1-11 from the build prompt without exception.
+  - Output the 5-line summary the build prompt's Step 7 requires.
+
+Blocked conditions (set blocked: true, Telegram-ping via
+agent/telegram_bot.py JARViSTelegramBot.push(), release lockfile, exit):
+  - Privacy violation detected in diff
+  - 3 fix attempts on the same phase exhausted
+  - Eval regression triggered an auto-rollback
+  - Phase 0 routing-fixable share <40% (branch decision)
+  - Any exit criterion that the spec marks unclear or wrong
+
+Do NOT:
+  - Modify the migration plan or build prompt to make exit criteria easier
+  - Push commits to remote
+  - Skip the privacy boundary grep before committing
+  - Continue past blocked: true
+  - Leave the lockfile behind on exit
+
+Begin.

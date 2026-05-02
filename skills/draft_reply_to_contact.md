@@ -1,26 +1,7 @@
 ---
 name: draft_reply_to_contact
 description: Draft a reply to a specific person using recent message history for context
-triggers:
-  - draft a reply
-  - draft reply
-  - write a reply
-  - reply to
-  - respond to
-  - write back to
-  - help me reply
-  - draft a message to
-  - write a message to
-tools:
-  - get_imessage_conversation
-  - get_recent_whatsapp_chats
-  - get_whatsapp_chat
-  - search_emails
-  - get_contact_profile
-  - search_memory
-  - queue_outbound_action
-model: frontier
-version: 2
+version: 3
 ---
 
 ## Workflow
@@ -29,32 +10,31 @@ version: 2
 
 2. Call `get_contact_profile` with the contact's name to see their dominant channel and last contact time.
 
-3. Based on dominant channel, fetch recent context:
-   - iMessage: call `get_imessage_conversation` (limit 10 messages)
-   - WhatsApp: `get_whatsapp_chat` requires a numeric `chat_id`, not a name.
-     First call `get_recent_whatsapp_chats` (limit 30) to find the chat whose
-     name matches the contact. Extract its `chat_id`, then call `get_whatsapp_chat`
-     with that `chat_id` (limit 10 messages). If no matching chat is found, say so.
-   - Email: call `search_emails` with `from:[contact name]` (limit 5)
+3. Based on dominant channel, fetch recent context (always fetch enough to see *both sides* — your outgoing replies are how Pepper learns your voice with this person):
+   - iMessage: `get_imessage_conversation` (limit 15) — already returns both directions.
+   - WhatsApp: `get_whatsapp_chat` requires a numeric `chat_id`. First call `get_recent_whatsapp_chats` (limit 30), find the chat whose name matches the contact, then call `get_whatsapp_chat` with that `chat_id` (limit 15). If no matching chat is found, say so and try iMessage instead.
+   - Email: call `search_emails` with `from:[name] OR to:[name]` (limit 8) so you see both your replies and theirs.
    - If dominant channel is unclear, try iMessage first, then email.
 
-4. Call `search_memory` with the contact's name to surface any relevant history, commitments, or context.
+4. Call `search_memory` with the contact's name to surface relevant history, prior commitments to/from them, and any flagged context (e.g., "Sarah is allergic to scope creep").
 
-5. Draft the reply:
-   - Match the tone of the existing conversation (casual vs. formal)
-   - Reference specific things from the thread — do not write a generic message
-   - Address the most recent unanswered question or request
-   - Keep it concise — match the length of their typical messages
+5. Check relationship framing — is this a close friend, colleague, boss, family, vendor, or stranger? If you're unsure and the answer would change the tone, call `skill_view("draft_reply_to_contact", ref="references/voice.md")` if available, or quickly grep the life context via `search_memory("relationship with [name]")`.
+
+6. Draft the reply:
+   - **Voice**: mirror the user's *outgoing* style from this thread (length, punctuation, formality, emoji use, sign-off). Don't impose a generic helpful-assistant tone.
+   - **Specificity**: reference concrete details from the thread — never write something that could be sent to anyone.
+   - **Focus**: address the most recent unanswered question or request first. If there are multiple, handle the highest-stakes one and flag the others.
+   - **Length**: match the length of *the user's* typical messages with this person, not the contact's.
    - Present the draft clearly labeled: "Draft reply:"
 
-6. Call `queue_outbound_action` with:
-   - `tool_name`: the appropriate send tool for the channel
-     (e.g. `mcp_imessage_send_message`, `mcp_whatsapp_send_message`, or `mcp_gmail_send_email`)
-   - `args`: the full arguments object needed to send (to/recipient, body/message, etc.)
-   - `preview`: a one-line summary like "Reply to Sarah via iMessage: <first 80 chars of draft>"
-   This enqueues the draft for your explicit approval in the Pepper status panel — nothing is sent until you approve.
+7. Queue the draft using the channel-specific drafter (preferred — they handle the right send tool internally):
+   - iMessage → `draft_imessage`
+   - WhatsApp → `draft_whatsapp`
+   - Email reply → `draft_email_reply`
+   - Fallback / unusual case → `queue_outbound_action`
 
-7. After queuing, confirm: "Draft queued for your review. You can approve, edit, or reject it from the status panel. Want me to adjust anything before you approve?"
+   Nothing is sent until the user approves it from the status panel.
 
-Never fabricate conversation history. Only draft based on what the tools return.
-Never send directly — always use queue_outbound_action so you keep full control.
+8. After queuing, confirm: "Draft queued for your review — approve, edit, or reject from the status panel. Want me to adjust the tone or content before you approve?"
+
+Never fabricate conversation history. Only draft based on what the tools return. Never bypass the drafter — every outbound message goes through user approval.

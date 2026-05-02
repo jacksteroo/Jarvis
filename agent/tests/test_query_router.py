@@ -202,6 +202,36 @@ def test_cross_source_triage_defaults_to_all_comms(router):
     assert "email" in d.target_sources or len(d.target_sources) > 1
 
 
+@pytest.mark.parametrize("message", [
+    "What did I miss in messages coming in?",
+    "Did I miss anything?",
+    "Anything I missed?",
+    "What came through overnight?",
+])
+def test_cross_source_triage_missed_messages(router, message):
+    """Generic 'what did I miss' / 'incoming messages' phrasings must trigger
+    deterministic cross-source triage so hermes3 doesn't hallucinate a 'no new
+    messages' answer."""
+    d = router.route(message)
+    assert d.intent_type in (IntentType.CROSS_SOURCE_TRIAGE, IntentType.INBOX_SUMMARY)
+    assert d.action_mode == ActionMode.CALL_TOOLS
+    # Must include at least one messaging channel.
+    assert any(
+        s in d.target_sources for s in ("email", "imessage", "whatsapp", "slack")
+    ), d.target_sources
+
+
+def test_generic_messages_query_fans_out_to_message_channels():
+    """A bare reference to 'messages' with no specific channel should fan out to
+    all messaging channels (and not just calendar)."""
+    sources = _infer_target_sources("What did I miss in messages coming in?")
+    assert "imessage" in sources
+    assert "whatsapp" in sources
+    assert "slack" in sources
+    assert "email" in sources
+    assert "calendar" not in sources
+
+
 # ── Person-centric lookups ─────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("message", [
@@ -578,3 +608,31 @@ def test_route_multi_does_not_split_action_tail(router):
 def test_route_multi_splits_on_semicolon(router):
     decisions = router.route_multi("any emails; what's on my calendar")
     assert len(decisions) == 2
+
+
+# ── Explicit web-search routing ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("message", [
+    "search the web for the latest trending shows on Netflix",
+    "google it for me",
+    "look it up online",
+    "look up online what time the Apple store closes",
+    "find online a place to eat near Harvard",
+    "search online for restaurant recommendations",
+])
+def test_explicit_web_search_routes_to_web_lookup(router, message):
+    d = router.route(message)
+    assert d.intent_type == IntentType.WEB_LOOKUP
+    assert d.action_mode == ActionMode.CALL_TOOLS
+
+
+@pytest.mark.parametrize("message", [
+    "search my memory for that conversation",
+    "search the inbox for last week's invoice",
+    "look up Sarah's number",  # plain "look up X" without online cue
+    "what's on my calendar",
+])
+def test_non_web_searches_do_not_match_web_lookup(router, message):
+    d = router.route(message)
+    assert d.intent_type != IntentType.WEB_LOOKUP

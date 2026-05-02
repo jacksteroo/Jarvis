@@ -1,0 +1,12 @@
+{"query": "How was my sleep score last night?", "pattern_id": "health-sleep", "notes": "Sleep tracker query; no health subsystem yet.", "intent_label": "unsupported_capability"}
+{"query": "Give me my sleep summary for the past month", "pattern_id": "health-sleep", "notes": "Time-scoped sleep retrieval; no wearable ingest.", "intent_label": "unsupported_capability"}
+{"query": "What was my heart rate during yesterday's run?", "pattern_id": "health-cardio", "notes": "Activity-scoped HR query; no health subsystem.", "intent_label": "unsupported_capability"}
+{"query": "What's my readiness from Oura today?", "pattern_id": "health-wearable", "notes": "Wearable score query; no Oura ingest.", "intent_label": "unsupported_capability"}
+{"query": "Am I recovered enough to train hard today?", "pattern_id": "health-advice", "notes": "Advice-without-data query; no health subsystem.", "intent_label": "unsupported_capability"}
+{"query": "How many steps did I take last week?", "pattern_id": "health-activity", "notes": "Step-count query; no activity tracker ingest.", "intent_label": "unsupported_capability"}
+{"query": "What's my heart rate variability trend this month?", "pattern_id": "health-trend", "notes": "HRV trend query; no health time-series.", "intent_label": "unsupported_capability"}
+{"query": "How many calories did I eat yesterday?", "pattern_id": "meal-calorie", "notes": "Meal log query; no nutrition tracker ingest.", "intent_label": "unsupported_capability"}
+{"query": "What was my Whoop strain score yesterday?", "pattern_id": "health-wearable", "notes": "Wearable score query; no Whoop ingest.", "intent_label": "unsupported_capability"}
+{"query": "Count the days I exercised this month", "pattern_id": "health-activity", "notes": "Activity count query; no exercise log.", "intent_label": "unsupported_capability"}
+{"query": "What's my protein intake this week?", "pattern_id": "meal-macro", "notes": "Macro tracking query; no nutrition log.", "intent_label": "unsupported_capability"}
+{"query": "Show me my weight trend over the last six months", "pattern_id": "health-trend", "notes": "Body composition trend; no health time-series.", "intent_label": "unsupported_capability"}

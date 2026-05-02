@@ -2,8 +2,16 @@ import asyncio
 import random
 import re
 import structlog
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    MessageReactionHandler,
+    filters,
+    ContextTypes,
+)
 from telegram.constants import ChatAction
 from agent.config import Settings
 from agent.models import AuditLog
@@ -38,6 +46,9 @@ class JARViSTelegramBot:
         self._allowed_ids = config.get_allowed_telegram_user_ids()
         self._app: Application = None
         self._bot: Bot = None
+        # Per-user "edit mode" state: when the user taps Edit, the next plain
+        # text message they send replaces the draft body for that action.
+        self._edit_pending: dict[int, str] = {}  # telegram_user_id → action_id
 
     async def setup(self) -> None:
         """Build the Application and register all handlers."""
@@ -48,10 +59,19 @@ class JARViSTelegramBot:
         self._app.add_handler(CommandHandler("brief", self._cmd_brief))
         self._app.add_handler(CommandHandler("review", self._cmd_review))
         self._app.add_handler(CommandHandler("status", self._cmd_status))
+        self._app.add_handler(CommandHandler("pending", self._cmd_pending))
         self._app.add_handler(CommandHandler("help", self._cmd_help))
+        self._app.add_handler(
+            CallbackQueryHandler(self._handle_action_callback, pattern=r"^pa:")
+        )
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
         )
+        # Capture 👍 / 👎 / etc. reactions on Pepper's outbound messages and
+        # turn them into explicit success_signal rows. The success-signal
+        # heuristic infers from text follow-ups; reactions give a stronger,
+        # one-tap channel for the migration's signal-coverage gate.
+        self._app.add_handler(MessageReactionHandler(self._handle_reaction))
         self._app.add_error_handler(self._error_handler)
 
     async def start(self) -> None:
@@ -59,7 +79,14 @@ class JARViSTelegramBot:
         await self.setup()
         await self._app.initialize()
         await self._app.start()
-        await self._app.updater.start_polling(drop_pending_updates=True)
+        # Reactions are not in the default allowed_updates set — we have to
+        # opt in explicitly or Telegram won't deliver MessageReactionUpdated
+        # at all. Subscribe to all update types python-telegram-bot knows
+        # about so future feedback channels (polls, edits) are covered too.
+        await self._app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
         logger.info("telegram_bot_started")
 
     async def stop(self) -> None:
@@ -122,6 +149,7 @@ class JARViSTelegramBot:
             "/brief — Generate morning brief now\n"
             "/review — Generate weekly review now\n"
             "/status — System status (subsystems, memory, scheduler)\n"
+            "/pending — List drafts awaiting your approval\n"
             "/help — Show this message\n\n"
             "Or just send any message to talk to Pepper.",
             parse_mode="Markdown",
@@ -208,9 +236,50 @@ class JARViSTelegramBot:
             return
         user_message = update.message.text
         session_id = str(update.effective_user.id)
+
+        # Edit-mode interception: if the user previously tapped ✏️ Edit on a
+        # draft, treat their next plain message as the replacement body and
+        # short-circuit the normal chat path. /cancel exits edit mode.
+        editing_action_id = self._edit_pending.get(update.effective_user.id)
+        if editing_action_id:
+            if user_message.strip().lower() in {"/cancel", "cancel"}:
+                self._consume_edit_target(update.effective_user.id)
+                await update.message.reply_text("Edit cancelled — draft kept as-is.")
+                return
+            self._consume_edit_target(update.effective_user.id)
+            edited = self.pepper.pending_actions.edit(editing_action_id, user_message)
+            if not edited:
+                await update.message.reply_text(
+                    f"Couldn't edit `{editing_action_id}` — it may have already been sent or rejected.",
+                    parse_mode="Markdown",
+                )
+                return
+            try:
+                await update.message.reply_text(
+                    self._format_pending(edited.to_dict()),
+                    parse_mode="Markdown",
+                    reply_markup=self._approval_keyboard(edited.id),
+                )
+            except Exception:
+                await update.message.reply_text(
+                    self._format_pending(edited.to_dict()),
+                    reply_markup=self._approval_keyboard(edited.id),
+                )
+            return
+
         logger.info("telegram_in", user_id=session_id, text=user_message[:300])
 
-        heavy, reason = self.pepper.decide_query_depth(user_message)
+        # Phase 3 cutover: route via the SemanticRouter primary so the
+        # heavy/light decision is consistent with the routing chat() will
+        # use. The capability-filter post-step is applied inside the helper.
+        try:
+            prerouted = await self.pepper.route_with_capability_filter(user_message)
+        except Exception as exc:
+            logger.warning("telegram_route_failed", error=str(exc))
+            prerouted = None
+        heavy, reason = self.pepper.decide_query_depth(
+            user_message, all_routings=prerouted
+        )
         logger.debug("telegram_query_depth", heavy=heavy, reason=reason, text=user_message[:80])
         chat_task = asyncio.create_task(
             self.pepper.chat(user_message, session_id, heavy=heavy, channel="Telegram")
@@ -275,7 +344,8 @@ class JARViSTelegramBot:
                     pass
                 if not response:
                     response = "I wasn't able to generate a response. Please try again."
-                await self._render_response(update.effective_chat.id, response)
+                last_msg_id = await self._render_response(update.effective_chat.id, response)
+                await self._record_outbound(session_id, update.effective_chat.id, last_msg_id)
             except Exception as e:
                 logger.error("message_handler_failed", error=str(e), exc_info=True)
                 try:
@@ -293,12 +363,26 @@ class JARViSTelegramBot:
                 logger.info("telegram_out", user_id=session_id, text=response[:300])
                 if not response:
                     response = "I wasn't able to generate a response. Please try again."
-                await self._render_response(update.effective_chat.id, response)
+                last_msg_id = await self._render_response(update.effective_chat.id, response)
+                await self._record_outbound(session_id, update.effective_chat.id, last_msg_id)
             except Exception as e:
                 logger.error("message_handler_failed", error=str(e), exc_info=True)
                 await update.message.reply_text("Something went wrong on my end. Please try again.")
             finally:
                 chat_task.cancel()
+
+    async def _record_outbound(
+        self, session_id: str, chat_id: int, message_id: int | None
+    ) -> None:
+        """Best-effort: stamp the outbound message id onto the routing_events row."""
+        if message_id is None:
+            return
+        try:
+            await self.pepper.record_outbound_message(
+                session_id=session_id, chat_id=chat_id, message_id=message_id
+            )
+        except Exception as exc:
+            logger.warning("telegram_outbound_record_failed", error=str(exc))
 
     # ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -312,8 +396,12 @@ class JARViSTelegramBot:
             logger.warning("telegram_photo_failed", url=url, error=str(e))
             return False
 
-    async def _render_response(self, chat_id: int, text: str) -> None:
-        """Render a response, extracting any [IMAGE:url] markers and sending them as photos."""
+    async def _render_response(self, chat_id: int, text: str) -> int | None:
+        """Render a response, extracting any [IMAGE:url] markers and sending them as photos.
+
+        Returns the message_id of the final text message sent (the one a
+        user is most likely to react to). ``None`` when nothing was sent.
+        """
         image_pattern = re.compile(r"\[IMAGE:([^\]]+)\]")
         images = image_pattern.findall(text)
         clean_text = image_pattern.sub("", text).strip()
@@ -322,7 +410,8 @@ class JARViSTelegramBot:
             await self._send_image(chat_id, url.strip())
 
         if clean_text:
-            await self._stream_response(chat_id, clean_text)
+            return await self._stream_response(chat_id, clean_text)
+        return None
 
     async def _send_long(self, chat_id, text: str, parse_mode: str = "Markdown") -> None:
         """Send text, splitting into chunks if > 4096 chars (Telegram limit)."""
@@ -337,13 +426,18 @@ class JARViSTelegramBot:
                 # Fallback: send without markdown if parse fails
                 await self._bot.send_message(chat_id=chat_id, text=chunk)
 
-    async def _stream_response(self, chat_id: int, text: str) -> None:
-        """Sentence-by-sentence reveal with spinning braille cursor pause between each."""
+    async def _stream_response(self, chat_id: int, text: str) -> int | None:
+        """Sentence-by-sentence reveal with spinning braille cursor pause between each.
+
+        Returns the message_id of the final paragraph sent so the caller
+        can record it for reaction-based feedback capture.
+        """
         paragraphs = [p.strip() for p in re.split(r'\n{2,}', text.strip()) if p.strip()]
         if not paragraphs:
-            return
+            return None
 
         cursor_frame = 0
+        last_message_id: int | None = None
 
         for para in paragraphs:
             if len(para) > 4000:
@@ -356,6 +450,7 @@ class JARViSTelegramBot:
                 cut_points.append(len(para))
 
             msg = await self._bot.send_message(chat_id=chat_id, text=_CURSORS[0])
+            last_message_id = msg.message_id
             prev_end = 0
 
             for end_pos in cut_points:
@@ -403,6 +498,238 @@ class JARViSTelegramBot:
                     )
                 except Exception:
                     pass
+
+        return last_message_id
+
+    # ─── Pending-action approval flow ──────────────────────────────────────
+
+    @staticmethod
+    def _channel_for_tool(tool_name: str) -> str:
+        return {
+            "send_email": "✉️ Email",
+            "send_imessage": "💬 iMessage",
+            "send_whatsapp": "🟢 WhatsApp",
+            "create_calendar_event": "📅 Calendar",
+        }.get(tool_name, tool_name)
+
+    def _format_pending(self, item: dict) -> str:
+        """Build the message body that the approve/reject buttons attach to."""
+        tool = item.get("tool_name", "")
+        args = item.get("args", {}) or {}
+        chan = self._channel_for_tool(tool)
+        lines = [f"*{chan} draft* — `id={item.get('id', '')}`"]
+        if tool == "send_email":
+            lines.append(f"*Account:* {args.get('account', 'default')}")
+            lines.append(f"*To:* {args.get('to', '')}")
+            if args.get("cc"):
+                lines.append(f"*Cc:* {args['cc']}")
+            lines.append(f"*Subject:* {args.get('subject', '')}")
+            lines.append("")
+            lines.append((args.get("body") or "")[:1500])
+        elif tool == "send_imessage":
+            target = args.get("chat_guid") or args.get("to") or ""
+            lines.append(f"*To:* {target}")
+            lines.append("")
+            lines.append((args.get("body") or "")[:1500])
+        elif tool == "send_whatsapp":
+            lines.append(f"*Chat:* {args.get('chat_id', '')}")
+            lines.append("")
+            lines.append((args.get("body") or args.get("message") or "")[:1500])
+        elif tool == "create_calendar_event":
+            lines.append(f"*Calendar:* {args.get('calendar_id', 'primary')} ({args.get('account', 'default')})")
+            lines.append(f"*Title:* {args.get('summary', '')}")
+            when = args.get("start", "")
+            until = args.get("end", "")
+            if when or until:
+                lines.append(f"*When:* {when} → {until}")
+            if args.get("location"):
+                lines.append(f"*Where:* {args['location']}")
+            if args.get("attendees"):
+                lines.append(f"*Attendees:* {args['attendees']}")
+            if args.get("description"):
+                lines.append("")
+                lines.append((args["description"] or "")[:1500])
+        else:
+            lines.append(item.get("preview", ""))
+        if item.get("model_description"):
+            lines.append("")
+            lines.append(f"_model says:_ {item['model_description'][:300]}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _approval_keyboard(action_id: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("✅ Send", callback_data=f"pa:approve:{action_id}"),
+                InlineKeyboardButton("✏️ Edit",  callback_data=f"pa:edit:{action_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"pa:reject:{action_id}"),
+            ]]
+        )
+
+    async def notify_pending_action(self, item) -> None:
+        """Push a freshly-queued draft to allowed users with inline buttons.
+
+        Wired via PendingActionsQueue.set_notifier in start.py. Best-effort —
+        any send failure is logged but never propagated back to the queue.
+        """
+        if not self._bot or not self._allowed_ids:
+            return
+        try:
+            payload = item.to_dict() if hasattr(item, "to_dict") else item
+        except Exception:
+            payload = {}
+        body = self._format_pending(payload)
+        markup = self._approval_keyboard(payload.get("id", ""))
+        for user_id in self._allowed_ids:
+            try:
+                await self._bot.send_message(
+                    chat_id=user_id, text=body, parse_mode="Markdown", reply_markup=markup,
+                )
+            except Exception:
+                # Markdown can choke on user-supplied text; fall back to plain.
+                try:
+                    await self._bot.send_message(
+                        chat_id=user_id, text=body, reply_markup=markup,
+                    )
+                except Exception as exc:
+                    logger.warning("telegram_pending_notify_failed", user_id=user_id, error=str(exc))
+
+    async def _cmd_pending(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._check_auth(update):
+            return
+        items = self.pepper.pending_actions.list_pending()
+        if not items:
+            await update.message.reply_text("No drafts pending approval.")
+            return
+        for item in items:
+            try:
+                await update.message.reply_text(
+                    self._format_pending(item),
+                    parse_mode="Markdown",
+                    reply_markup=self._approval_keyboard(item.get("id", "")),
+                )
+            except Exception:
+                await update.message.reply_text(
+                    self._format_pending(item),
+                    reply_markup=self._approval_keyboard(item.get("id", "")),
+                )
+
+    async def _handle_action_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Inline-button handler for pa:approve / pa:edit / pa:reject."""
+        query = update.callback_query
+        if query is None or not query.data:
+            return
+        if not self._is_allowed(query.from_user.id):
+            await query.answer("Unauthorized.", show_alert=True)
+            return
+        try:
+            _, action, action_id = query.data.split(":", 2)
+        except ValueError:
+            await query.answer("Bad callback.", show_alert=True)
+            return
+
+        item = self.pepper.pending_actions.get(action_id)
+        if not item:
+            await query.answer("Draft not found (already handled?).", show_alert=True)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        if action == "approve":
+            await query.answer("Sending…")
+            executed = await self.pepper.pending_actions.approve(action_id)
+            await self._finalize_action_message(query, executed)
+        elif action == "reject":
+            self.pepper.pending_actions.reject(action_id)
+            await query.answer("Rejected.")
+            try:
+                await query.edit_message_text(
+                    self._format_pending(item.to_dict()) + "\n\n_❌ rejected_",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        elif action == "edit":
+            self._edit_pending[query.from_user.id] = action_id
+            await query.answer("Send the new body as your next message.")
+            try:
+                await self._bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=(
+                        f"✏️ Edit mode for `{action_id}` — send the replacement body as your "
+                        "next message. Send /cancel to abort."
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        else:
+            await query.answer("Unknown action.", show_alert=True)
+
+    async def _finalize_action_message(self, query, executed) -> None:
+        """Replace the inline-button message with the post-execution status."""
+        if executed is None:
+            try:
+                await query.edit_message_text("Draft not found.")
+            except Exception:
+                pass
+            return
+        snapshot = executed.to_dict()
+        status = snapshot.get("status", "?")
+        result = snapshot.get("result") or {}
+        if status == "executed":
+            tail = "\n\n_✅ sent_"
+            if isinstance(result, dict) and result.get("id"):
+                tail += f" id=`{result['id']}`"
+        else:
+            err = (result or {}).get("error", "unknown error") if isinstance(result, dict) else "failed"
+            tail = f"\n\n_⚠️ {status}: {err}_"
+        body = self._format_pending(snapshot) + tail
+        try:
+            await query.edit_message_text(body, parse_mode="Markdown")
+        except Exception:
+            try:
+                await query.edit_message_text(body)
+            except Exception:
+                pass
+
+    def _consume_edit_target(self, user_id: int) -> str | None:
+        """Pop the action_id the user is currently editing, if any."""
+        return self._edit_pending.pop(user_id, None)
+
+    async def _handle_reaction(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Map an inbound 👍/👎 (etc.) reaction to a routing_events row."""
+        reaction = update.message_reaction
+        if reaction is None:
+            return
+        # Auth: only allowed users' reactions count.
+        user = reaction.user
+        if user is None or not self._is_allowed(user.id):
+            return
+        new_emojis = [
+            r.emoji for r in (reaction.new_reaction or []) if getattr(r, "emoji", None)
+        ]
+        try:
+            applied = await self.pepper.apply_reaction_signal(
+                chat_id=reaction.chat.id,
+                message_id=reaction.message_id,
+                emojis=new_emojis,
+            )
+            logger.info(
+                "telegram_reaction_received",
+                chat_id=reaction.chat.id,
+                message_id=reaction.message_id,
+                emojis=new_emojis,
+                signal_applied=applied,
+            )
+        except Exception as exc:
+            logger.warning("telegram_reaction_handler_failed", error=str(exc))
 
     async def _audit(self, details: str) -> None:
         if not self.pepper.db_factory:

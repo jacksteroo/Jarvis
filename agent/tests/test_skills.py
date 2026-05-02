@@ -1,78 +1,90 @@
-"""Tests for the Phase 4 skill system (agent/skills.py + agent/skill_reviewer.py)."""
+"""Tests for the lazy-load skill system (agent/skills.py)."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from textwrap import dedent
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent.skills import Skill, SkillMatcher, _parse_frontmatter, _load_skill, load_skills
+from agent.skills import (
+    Skill,
+    parse_frontmatter,
+    _load_skill,
+    load_skills,
+    load_all_skills,
+    build_index,
+    read_skill_reference,
+    sync_repo_skills_to_user_dir,
+)
 
 
-# ── _parse_frontmatter ────────────────────────────────────────────────────────
+# ── parse_frontmatter ────────────────────────────────────────────────────────
 
 def test_parse_frontmatter_extracts_dict_and_body():
     raw = dedent("""\
         ---
         name: test_skill
         description: A test skill
-        triggers:
-          - hello
-          - hi there
-        tools:
-          - search_memory
-        model: local
         version: 1
+        references:
+          - references/foo.md
         ---
 
         ## Workflow
 
         1. Do something.
     """)
-    fm, body = _parse_frontmatter(raw)
+    fm, body = parse_frontmatter(raw)
     assert fm["name"] == "test_skill"
-    assert fm["triggers"] == ["hello", "hi there"]
-    assert fm["tools"] == ["search_memory"]
-    assert fm["version"] == 1
+    assert fm["description"] == "A test skill"
+    assert fm["references"] == ["references/foo.md"]
     assert "Do something" in body
 
 
 def test_parse_frontmatter_no_frontmatter_returns_empty_dict():
     raw = "Just some content with no frontmatter."
-    fm, body = _parse_frontmatter(raw)
+    fm, body = parse_frontmatter(raw)
     assert fm == {}
     assert body == raw
 
 
 def test_parse_frontmatter_empty_yaml_returns_empty_dict():
     raw = "---\n---\nBody here."
-    fm, body = _parse_frontmatter(raw)
+    fm, body = parse_frontmatter(raw)
     assert fm == {}
     assert "Body here" in body
 
 
 # ── _load_skill ───────────────────────────────────────────────────────────────
 
-def _write_skill(tmp_path: Path, content: str, filename: str = "my_skill.md") -> Path:
+def _write_flat_skill(tmp_path: Path, content: str, filename: str = "my_skill.md") -> Path:
     path = tmp_path / filename
     path.write_text(content, encoding="utf-8")
     return path
 
 
-def test_load_skill_valid_file(tmp_path):
-    path = _write_skill(tmp_path, dedent("""\
+def _write_folder_skill(
+    tmp_path: Path,
+    name: str,
+    content: str,
+    references: dict[str, str] | None = None,
+) -> Path:
+    folder = tmp_path / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "SKILL.md").write_text(content, encoding="utf-8")
+    if references:
+        (folder / "references").mkdir(exist_ok=True)
+        for ref_name, ref_body in references.items():
+            (folder / "references" / ref_name).write_text(ref_body, encoding="utf-8")
+    return folder
+
+
+def test_load_skill_valid_flat_file(tmp_path):
+    path = _write_flat_skill(tmp_path, dedent("""\
         ---
         name: morning_brief
         description: Daily brief
-        triggers:
-          - morning brief
-          - daily brief
-        tools:
-          - get_upcoming_events
-        model: local
         version: 2
         ---
 
@@ -85,13 +97,12 @@ def test_load_skill_valid_file(tmp_path):
     assert skill is not None
     assert skill.name == "morning_brief"
     assert skill.version == 2
-    assert "morning brief" in skill.triggers
-    assert "get_upcoming_events" in skill.tools
+    assert skill.root is None  # flat form has no folder root
     assert "Workflow" in skill.content
 
 
 def test_load_skill_missing_name_returns_none(tmp_path):
-    path = _write_skill(tmp_path, dedent("""\
+    path = _write_flat_skill(tmp_path, dedent("""\
         ---
         description: No name here
         ---
@@ -102,7 +113,7 @@ def test_load_skill_missing_name_returns_none(tmp_path):
 
 
 def test_load_skill_empty_body_returns_none(tmp_path):
-    path = _write_skill(tmp_path, dedent("""\
+    path = _write_flat_skill(tmp_path, dedent("""\
         ---
         name: empty_skill
         ---
@@ -110,20 +121,35 @@ def test_load_skill_empty_body_returns_none(tmp_path):
     assert _load_skill(path) is None
 
 
-def test_load_skill_triggers_lowercased(tmp_path):
-    path = _write_skill(tmp_path, dedent("""\
+def test_load_skill_references_only_markdown(tmp_path):
+    path = _write_flat_skill(tmp_path, dedent("""\
         ---
         name: demo
-        triggers:
-          - Morning Brief
-          - DAILY BRIEF
+        references:
+          - references/keep.md
+          - scripts/drop.py
+          - assets/drop.png
         ---
         ## Workflow
         1. Run.
     """))
     skill = _load_skill(path)
     assert skill is not None
-    assert all(t == t.lower() for t in skill.triggers)
+    assert skill.references == ["references/keep.md"]
+
+
+def test_load_skill_invalid_version_falls_back_to_one(tmp_path):
+    path = _write_flat_skill(tmp_path, dedent("""\
+        ---
+        name: weird
+        version: not-a-number
+        ---
+        ## Workflow
+        1. Run.
+    """))
+    skill = _load_skill(path)
+    assert skill is not None
+    assert skill.version == 1
 
 
 # ── load_skills ───────────────────────────────────────────────────────────────
@@ -133,13 +159,12 @@ def test_load_skills_returns_empty_for_missing_dir(tmp_path):
     assert skills == []
 
 
-def test_load_skills_loads_all_md_files(tmp_path):
+def test_load_skills_loads_flat_files(tmp_path):
     for i in range(3):
-        _write_skill(tmp_path, dedent(f"""\
+        _write_flat_skill(tmp_path, dedent(f"""\
             ---
             name: skill_{i}
-            triggers:
-              - trigger {i}
+            description: Test {i}
             ---
             ## Workflow
             Step {i}.
@@ -151,123 +176,214 @@ def test_load_skills_loads_all_md_files(tmp_path):
     assert names == {"skill_0", "skill_1", "skill_2"}
 
 
+def test_load_skills_loads_folder_form(tmp_path):
+    _write_folder_skill(tmp_path, "alpha", dedent("""\
+        ---
+        name: alpha
+        description: Alpha skill
+        ---
+        ## Workflow
+        Do alpha.
+    """))
+    skills = load_skills(skills_dir=tmp_path)
+    assert len(skills) == 1
+    assert skills[0].name == "alpha"
+    assert skills[0].root is not None
+    assert skills[0].root.name == "alpha"
+
+
+def test_load_skills_handles_mixed_layouts(tmp_path):
+    _write_folder_skill(tmp_path, "folder_skill", dedent("""\
+        ---
+        name: folder_skill
+        ---
+        ## Workflow
+        Folder.
+    """))
+    _write_flat_skill(tmp_path, dedent("""\
+        ---
+        name: flat_skill
+        ---
+        ## Workflow
+        Flat.
+    """), filename="flat_skill.md")
+
+    skills = load_skills(skills_dir=tmp_path)
+    names = {s.name for s in skills}
+    assert names == {"folder_skill", "flat_skill"}
+
+
+def test_load_skills_folder_wins_on_collision(tmp_path):
+    # Folder form runs first; flat with same name should be skipped.
+    _write_folder_skill(tmp_path, "dup", dedent("""\
+        ---
+        name: dup
+        description: from folder
+        ---
+        ## Workflow
+        Folder.
+    """))
+    _write_flat_skill(tmp_path, dedent("""\
+        ---
+        name: dup
+        description: from flat
+        ---
+        ## Workflow
+        Flat.
+    """), filename="dup.md")
+    skills = load_skills(skills_dir=tmp_path)
+    assert len(skills) == 1
+    assert skills[0].description == "from folder"
+
+
 def test_load_skills_skips_invalid_files(tmp_path):
-    _write_skill(tmp_path, dedent("""\
+    _write_flat_skill(tmp_path, dedent("""\
         ---
         name: good_skill
-        triggers:
-          - do the thing
         ---
         ## Workflow
         1. Do it.
     """), filename="good.md")
-
-    # File with no name — should be skipped
-    _write_skill(tmp_path, "---\ndescription: no name\n---\n## Workflow\n1. Nope.", filename="bad.md")
+    _write_flat_skill(tmp_path, "---\ndescription: no name\n---\n## Workflow\n1. Nope.", filename="bad.md")
 
     skills = load_skills(skills_dir=tmp_path)
     assert len(skills) == 1
     assert skills[0].name == "good_skill"
 
 
-# ── SkillMatcher.match ────────────────────────────────────────────────────────
+# ── load_all_skills (user dir overrides repo dir) ─────────────────────────────
 
-def _make_skill(name: str, triggers: list[str]) -> Skill:
-    return Skill(
-        name=name,
-        description="",
-        triggers=[t.lower() for t in triggers],
-        tools=[],
-        model="local",
-        version=1,
-        content="## Workflow\n1. Run.",
-        path=Path(f"/fake/{name}.md"),
-    )
+def test_load_all_skills_user_overrides_repo(tmp_path):
+    user_dir = tmp_path / "user"
+    repo_dir = tmp_path / "repo"
+    user_dir.mkdir()
+    repo_dir.mkdir()
 
+    _write_flat_skill(user_dir, dedent("""\
+        ---
+        name: shared
+        description: from user
+        ---
+        ## Workflow
+        User.
+    """), filename="shared.md")
+    _write_flat_skill(repo_dir, dedent("""\
+        ---
+        name: shared
+        description: from repo
+        ---
+        ## Workflow
+        Repo.
+    """), filename="shared.md")
+    _write_flat_skill(repo_dir, dedent("""\
+        ---
+        name: repo_only
+        description: only in repo
+        ---
+        ## Workflow
+        Repo only.
+    """), filename="repo_only.md")
 
-def test_matcher_returns_empty_when_no_skills():
-    matcher = SkillMatcher([])
-    assert matcher.match("anything") == []
-
-
-def test_matcher_matches_by_trigger_phrase():
-    skill = _make_skill("morning_brief", ["morning brief", "daily brief"])
-    matcher = SkillMatcher([skill])
-    result = matcher.match("Generate my morning brief for today.")
-    assert len(result) == 1
-    assert result[0].name == "morning_brief"
-
-
-def test_matcher_returns_empty_when_no_triggers_match():
-    skill = _make_skill("weekly_review", ["weekly review", "week in review"])
-    matcher = SkillMatcher([skill])
-    result = matcher.match("What time is it?")
-    assert result == []
-
-
-def test_matcher_ranks_by_trigger_hit_count():
-    skill_a = _make_skill("skill_a", ["review", "weekly"])
-    skill_b = _make_skill("skill_b", ["review"])
-    matcher = SkillMatcher([skill_a, skill_b])
-    # "weekly review" hits skill_a twice, skill_b once
-    result = matcher.match("weekly review please", top_n=2)
-    assert result[0].name == "skill_a"
-    assert result[1].name == "skill_b"
+    skills = load_all_skills(user_dir=user_dir, repo_dir=repo_dir)
+    by_name = {s.name: s for s in skills}
+    assert by_name["shared"].description == "from user"
+    assert "repo_only" in by_name
 
 
-def test_matcher_respects_top_n():
-    skills = [_make_skill(f"skill_{i}", ["common phrase"]) for i in range(5)]
-    matcher = SkillMatcher(skills)
-    result = matcher.match("common phrase", top_n=2)
-    assert len(result) == 2
+# ── build_index ───────────────────────────────────────────────────────────────
+
+def test_build_index_empty_returns_empty_string():
+    assert build_index([]) == ""
 
 
-def test_matcher_case_insensitive():
-    skill = _make_skill("demo", ["meeting prep"])
-    matcher = SkillMatcher([skill])
-    assert len(matcher.match("MEETING PREP for tomorrow")) == 1
+def test_build_index_lists_skills_alphabetically(tmp_path):
+    _write_flat_skill(tmp_path, "---\nname: zebra\ndescription: Z\n---\nbody",
+                      filename="zebra.md")
+    _write_flat_skill(tmp_path, "---\nname: alpha\ndescription: A\n---\nbody",
+                      filename="alpha.md")
+    skills = load_skills(skills_dir=tmp_path)
+    index = build_index(skills)
+    alpha_pos = index.find("- alpha")
+    zebra_pos = index.find("- zebra")
+    assert alpha_pos != -1 and zebra_pos != -1
+    assert alpha_pos < zebra_pos
+    assert "skill_view" in index
+    assert "skill_search" in index
 
 
-# ── SkillMatcher.inject_into_prompt ──────────────────────────────────────────
-
-def test_inject_appends_skill_block():
-    skill = _make_skill("morning_brief", ["morning brief"])
-    skill.content = "## Workflow\n1. Greet."  # type: ignore[attr-defined]
-    matcher = SkillMatcher([skill])
-
-    result = matcher.inject_into_prompt("Base prompt.", "morning brief please")
-    assert "Base prompt." in result
-    assert '<skill name="morning_brief">' in result
-    assert "## Workflow" in result
-    assert "</skill>" in result
-
-
-def test_inject_returns_prompt_unchanged_when_no_match():
-    skill = _make_skill("morning_brief", ["morning brief"])
-    matcher = SkillMatcher([skill])
-
-    original = "My system prompt."
-    result = matcher.inject_into_prompt(original, "what time is it?")
-    assert result == original
+def test_build_index_truncates_long_descriptions(tmp_path):
+    long_desc = "x" * 300
+    _write_flat_skill(tmp_path, f"---\nname: long\ndescription: {long_desc}\n---\nbody",
+                      filename="long.md")
+    skills = load_skills(skills_dir=tmp_path)
+    index = build_index(skills)
+    for line in index.splitlines():
+        if line.startswith("- long"):
+            assert len(line) < 200
+            assert line.endswith("...")
+            break
+    else:
+        pytest.fail("long skill not found in index")
 
 
-def test_inject_multiple_skills_all_appear():
-    skill_a = _make_skill("skill_a", ["alpha"])
-    skill_b = _make_skill("skill_b", ["beta"])
-    matcher = SkillMatcher([skill_a, skill_b])
+# ── read_skill_reference ──────────────────────────────────────────────────────
 
-    result = matcher.inject_into_prompt("Prompt.", "alpha beta query")
-    assert '<skill name="skill_a">' in result
-    assert '<skill name="skill_b">' in result
+def test_read_skill_reference_returns_declared_md(tmp_path):
+    _write_folder_skill(tmp_path, "demo", dedent("""\
+        ---
+        name: demo
+        references:
+          - references/extra.md
+        ---
+        ## Workflow
+        Body.
+    """), references={"extra.md": "extra body"})
+    skills = load_skills(skills_dir=tmp_path)
+    skill = skills[0]
+    body = read_skill_reference(skill, "references/extra.md")
+    assert body == "extra body"
 
 
-# ── Real skills directory ─────────────────────────────────────────────────────
+def test_read_skill_reference_rejects_undeclared(tmp_path):
+    _write_folder_skill(tmp_path, "demo", dedent("""\
+        ---
+        name: demo
+        ---
+        ## Workflow
+        Body.
+    """), references={"sneaky.md": "sneaky"})
+    skills = load_skills(skills_dir=tmp_path)
+    skill = skills[0]
+    assert read_skill_reference(skill, "references/sneaky.md") is None
+
+
+def test_read_skill_reference_rejects_path_traversal(tmp_path):
+    _write_folder_skill(tmp_path, "demo", dedent("""\
+        ---
+        name: demo
+        references:
+          - ../escape.md
+        ---
+        ## Workflow
+        Body.
+    """))
+    (tmp_path / "escape.md").write_text("escaped", encoding="utf-8")
+    skills = load_skills(skills_dir=tmp_path)
+    skill = skills[0]
+    assert read_skill_reference(skill, "../escape.md") is None
+
+
+def test_read_skill_reference_returns_none_for_flat_skill(tmp_path):
+    _write_flat_skill(tmp_path, "---\nname: flat\n---\nbody", filename="flat.md")
+    skills = load_skills(skills_dir=tmp_path)
+    assert read_skill_reference(skills[0], "anything.md") is None
+
+
+# ── Real skills directory ────────────────────────────────────────────────────
 
 def test_real_skills_directory_loads():
-    """Verify the skills/ directory in the repo loads without errors."""
+    """The five legacy flat skills in skills/ still load."""
     skills = load_skills()
-    # At minimum the 5 seeded skills should be present
-    assert len(skills) >= 5
     names = {s.name for s in skills}
     expected = {
         "morning_brief",
@@ -279,51 +395,89 @@ def test_real_skills_directory_loads():
     assert expected.issubset(names)
 
 
-def test_real_skills_have_triggers():
+def test_real_skills_appear_in_index():
     skills = load_skills()
-    for skill in skills:
-        assert skill.triggers, f"Skill '{skill.name}' has no triggers"
+    index = build_index(skills)
+    for name in ("morning_brief", "weekly_review", "commitment_check"):
+        assert f"- {name}" in index
 
 
-def test_real_skills_have_workflow_content():
-    skills = load_skills()
-    for skill in skills:
-        assert "Workflow" in skill.content or "workflow" in skill.content.lower(), \
-            f"Skill '{skill.name}' has no Workflow section"
+# ── sync_repo_skills_to_user_dir ─────────────────────────────────────────────
+
+def _write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
 
 
-def test_morning_brief_skill_triggers_match_scheduler_message():
-    """The phrase the scheduler sends must match the morning_brief skill."""
-    skills = load_skills()
-    matcher = SkillMatcher(skills)
+def test_sync_creates_flat_and_folder_skills_in_user_dir(tmp_path):
+    repo = tmp_path / "repo"
+    user = tmp_path / "user"
+    _write(repo / "alpha.md", "---\nname: alpha\nversion: 1\n---\nbody A")
+    _write(repo / "beta" / "SKILL.md", "---\nname: beta\nversion: 1\n---\nbody B")
 
-    import datetime as dt
-    today = dt.datetime.now().strftime("%A, %B %-d, %Y")
-    result = matcher.match(f"Generate my morning brief for {today}.")
-    names = [s.name for s in result]
-    assert "morning_brief" in names, f"morning_brief not matched; got: {names}"
+    counts = sync_repo_skills_to_user_dir(user_dir=user, repo_dir=repo)
 
-
-def test_weekly_review_skill_triggers_match_scheduler_message():
-    """The phrase the scheduler sends must match the weekly_review skill."""
-    skills = load_skills()
-    matcher = SkillMatcher(skills)
-
-    import datetime as dt
-    week_label = dt.datetime.now().strftime("Week of %B %-d, %Y")
-    result = matcher.match(f"Generate my weekly review for {week_label}.")
-    names = [s.name for s in result]
-    assert "weekly_review" in names, f"weekly_review not matched; got: {names}"
+    assert counts == {"created": 2, "updated": 0, "unchanged": 0}
+    assert (user / "alpha" / "SKILL.md").read_text() == "---\nname: alpha\nversion: 1\n---\nbody A"
+    assert (user / "beta" / "SKILL.md").read_text() == "---\nname: beta\nversion: 1\n---\nbody B"
 
 
-def test_commitment_check_skill_triggers_match_scheduler_message():
-    """The phrase the scheduler sends must match the commitment_check skill."""
-    skills = load_skills()
-    matcher = SkillMatcher(skills)
+def test_sync_is_idempotent(tmp_path):
+    repo = tmp_path / "repo"
+    user = tmp_path / "user"
+    _write(repo / "alpha.md", "---\nname: alpha\nversion: 1\n---\nbody")
 
-    result = matcher.match(
-        "Commitment check: list any open commitments older than 48 hours. "
-        "Skip anything already resolved."
-    )
-    names = [s.name for s in result]
-    assert "commitment_check" in names, f"commitment_check not matched; got: {names}"
+    sync_repo_skills_to_user_dir(user_dir=user, repo_dir=repo)
+    counts = sync_repo_skills_to_user_dir(user_dir=user, repo_dir=repo)
+
+    assert counts == {"created": 0, "updated": 0, "unchanged": 1}
+
+
+def test_sync_overwrites_drifted_user_copy(tmp_path):
+    repo = tmp_path / "repo"
+    user = tmp_path / "user"
+    _write(repo / "alpha.md", "---\nname: alpha\nversion: 1\n---\nfresh body")
+
+    sync_repo_skills_to_user_dir(user_dir=user, repo_dir=repo)
+    # Simulate drift: someone edited the user copy directly
+    (user / "alpha" / "SKILL.md").write_text("STALE")
+
+    counts = sync_repo_skills_to_user_dir(user_dir=user, repo_dir=repo)
+
+    assert counts == {"created": 0, "updated": 1, "unchanged": 0}
+    assert (user / "alpha" / "SKILL.md").read_text() == "---\nname: alpha\nversion: 1\n---\nfresh body"
+
+
+def test_sync_preserves_user_only_skills(tmp_path):
+    """Skills installed via skill_install (no repo counterpart) must survive sync."""
+    repo = tmp_path / "repo"
+    user = tmp_path / "user"
+    _write(repo / "alpha.md", "---\nname: alpha\nversion: 1\n---\nrepo skill")
+    _write(user / "user_only" / "SKILL.md", "---\nname: user_only\nversion: 1\n---\nlocal install")
+
+    sync_repo_skills_to_user_dir(user_dir=user, repo_dir=repo)
+
+    assert (user / "user_only" / "SKILL.md").exists()
+    assert (user / "user_only" / "SKILL.md").read_text() == "---\nname: user_only\nversion: 1\n---\nlocal install"
+
+
+def test_sync_mirrors_folder_form_assets(tmp_path):
+    """Folder-form skills with references/*.md should have those mirrored too."""
+    repo = tmp_path / "repo"
+    user = tmp_path / "user"
+    _write(repo / "beta" / "SKILL.md", "---\nname: beta\nversion: 1\n---\nbody")
+    _write(repo / "beta" / "references" / "extra.md", "reference content")
+
+    sync_repo_skills_to_user_dir(user_dir=user, repo_dir=repo)
+
+    assert (user / "beta" / "references" / "extra.md").read_text() == "reference content"
+
+
+def test_sync_skips_silently_when_repo_missing(tmp_path):
+    user = tmp_path / "user"
+    repo = tmp_path / "nope"  # does not exist
+
+    counts = sync_repo_skills_to_user_dir(user_dir=user, repo_dir=repo)
+
+    assert counts == {"created": 0, "updated": 0, "unchanged": 0}
+    assert not user.exists()

@@ -20,17 +20,19 @@ WhatsApp Desktop DB schema (simplified):
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import structlog
 
 logger = structlog.get_logger()
 
-import os as _os
+_os = os
 
 # Primary DB location — Docker mount takes priority when available
 WHATSAPP_DB = (
@@ -328,3 +330,59 @@ class WhatsAppClient:
     @staticmethod
     def parse_export(path: Path) -> list[dict]:
         return parse_export_file(path)
+
+    # ── Outbound (via local Node.js bridge) ────────────────────────────────
+    #
+    # Reads continue to come straight from the SQLite DB above. Sends go through
+    # subsystems/communications/whatsapp_bridge (whatsapp-web.js), which Pepper
+    # only needs running when an approved draft is being delivered.
+
+    async def send(
+        self,
+        chat_id: str,
+        message: str,
+        reply_to: Optional[str] = None,
+    ) -> dict:
+        """POST a send to the local WhatsApp bridge. Raises on transport error.
+
+        chat_id: phone digits, JID (`...@c.us`), or group JID (`...@g.us`).
+        reply_to: optional bridge message id to quote.
+        """
+        url = (os.environ.get("PEPPER_WA_BRIDGE_URL") or "http://127.0.0.1:3025").rstrip("/")
+        token = os.environ.get("PEPPER_WA_BRIDGE_TOKEN", "")
+        if not chat_id or not message:
+            raise ValueError("chat_id and message are required")
+        headers = {"x-pepper-token": token} if token else {}
+        payload = {"chatId": chat_id, "message": message}
+        if reply_to:
+            payload["replyTo"] = reply_to
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(f"{url}/send", json=payload, headers=headers)
+
+        if resp.status_code == 401:
+            raise PermissionError("WhatsApp bridge rejected token (PEPPER_WA_BRIDGE_TOKEN mismatch).")
+        if resp.status_code == 503:
+            raise RuntimeError(
+                "WhatsApp bridge is not ready. Start it (npm start in subsystems/communications/whatsapp_bridge) "
+                "and complete QR pairing if prompted."
+            )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"WhatsApp bridge error {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        logger.info("whatsapp_sent", chat_id=chat_id[:32], length=len(message), msg_id=data.get("id"))
+        return {"ok": True, "id": data.get("id"), "to": chat_id}
+
+    @staticmethod
+    async def bridge_health() -> dict:
+        """Probe the bridge's /health endpoint. Returns {} on transport error."""
+        url = (os.environ.get("PEPPER_WA_BRIDGE_URL") or "http://127.0.0.1:3025").rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(f"{url}/health")
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception:
+            return {}
+        return {}

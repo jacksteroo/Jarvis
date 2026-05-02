@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Phase 1 Task 7 of docs/SEMANTIC_ROUTER_MIGRATION.md.
+# Inspect Pepper's routing_events table from the host shell.
+exec docker compose exec pepper python -m agent.router_logs "$@"

@@ -1,0 +1,61 @@
+{"query": "Where is Susan staying during the Orlando trip?", "pattern_id": 1, "notes": "Travel-shaped personal Q routes to person_lookup, not generic calendar.", "intent_label": "person_lookup"}
+{"query": "Did Matthew confirm the East Coast meet-up with Senky?", "pattern_id": 1, "notes": "Travel-shaped personal Q with person scope.", "intent_label": "person_lookup"}
+{"query": "What hotel did Anna book for the volleyball tournament weekend?", "pattern_id": 1, "notes": "Person + travel detail.", "intent_label": "person_lookup"}
+{"query": "Where is Jessie meeting up with the family on the East Coast?", "pattern_id": 1, "notes": "Travel-shaped person scope.", "intent_label": "person_lookup"}
+{"query": "What is Susan's flight number for the Orlando departure?", "pattern_id": 1, "notes": "Travel detail tied to person.", "intent_label": "person_lookup"}
+{"query": "What was Eupean's hotel for the last Boston trip?", "pattern_id": 1, "notes": "Historical travel-shaped person query.", "intent_label": "person_lookup"}
+{"query": "Pull up details on my partner's last work trip", "pattern_id": 1, "notes": "Travel synthesis across sources.", "intent_label": "cross_source_triage"}
+{"query": "What appointments should I be aware of this afternoon?", "pattern_id": 3, "notes": "Obvious calendar need, no keyword overlap with regex tables.", "intent_label": "schedule_lookup"}
+{"query": "Fill me in on what's happening tomorrow morning", "pattern_id": 3, "notes": "Schedule retrieval phrased loosely.", "intent_label": "schedule_lookup"}
+{"query": "Any urgent threads I should be looking at right now?", "pattern_id": 3, "notes": "Email triage paraphrase.", "intent_label": "inbox_summary"}
+{"query": "Bring me up to speed on what I missed in email", "pattern_id": 3, "notes": "Inbox catch-up phrased without keywords.", "intent_label": "inbox_summary"}
+{"query": "What's been going on with my messages today?", "pattern_id": 3, "notes": "Generic phrasing for inbox triage.", "intent_label": "inbox_summary"}
+{"query": "Track my running progress over the past two weeks", "pattern_id": 4, "notes": "Time-scoped self-tracking. [iter15-adj: relabel action_items→unsupported_capability — no health/meal subsystem yet]", "intent_label": "unsupported_capability"}
+{"query": "How many pickleball sessions did I log this month?", "pattern_id": 4, "notes": "Time-scoped count of activities. [iter15-adj: relabel action_items→unsupported_capability — no health/meal subsystem yet]", "intent_label": "unsupported_capability"}
+{"query": "Show me what workouts I completed last week", "pattern_id": 4, "notes": "Time-scoped workout retrieval. [iter15-adj: relabel action_items→unsupported_capability — no health/meal subsystem yet]", "intent_label": "unsupported_capability"}
+{"query": "List the meals I logged yesterday", "pattern_id": 4, "notes": "Time-scoped meal log. [iter15-adj: relabel action_items→unsupported_capability — no health/meal subsystem yet]", "intent_label": "unsupported_capability"}
+{"query": "What flights have I booked for the next 30 days?", "pattern_id": 4, "notes": "Time-scoped travel retrieval.", "intent_label": "schedule_lookup"}
+{"query": "Walk me through everything on my plate next week", "pattern_id": 4, "notes": "Time-scoped schedule wide retrieval.", "intent_label": "schedule_lookup"}
+{"query": "What do I have planned for the rest of this quarter?", "pattern_id": 4, "notes": "Long horizon time-scoped schedule.", "intent_label": "schedule_lookup"}
+{"query": "What did Senky say about the school pickup change?", "pattern_id": 5, "notes": "Person + conversational scope.", "intent_label": "conversation_lookup"}
+{"query": "Remind me what Jessie texted about the Saturday plan", "pattern_id": 5, "notes": "Person + recent text retrieval.", "intent_label": "conversation_lookup"}
+{"query": "Has Euven sent anything in the last few days?", "pattern_id": 5, "notes": "Person inbox query.", "intent_label": "conversation_lookup"}
+{"query": "What's the latest from Anna?", "pattern_id": 5, "notes": "Person inbox catch-up.", "intent_label": "conversation_lookup"}
+{"query": "Did Eupean reply to my message about dinner?", "pattern_id": 5, "notes": "Person message status.", "intent_label": "conversation_lookup"}
+{"query": "Pull up everything Susan sent about Orlando logistics", "pattern_id": 5, "notes": "Person scope across context.", "intent_label": "person_lookup"}
+{"query": "What is Matthew currently working on at Harvard?", "pattern_id": 5, "notes": "Person status retrieval.", "intent_label": "person_lookup"}
+{"query": "What did I decide about the Q2 product launch direction?", "pattern_id": 6, "notes": "Knowledge / past-decision retrieval.", "intent_label": "conversation_lookup"}
+{"query": "Remind me what we landed on for the pricing model", "pattern_id": 6, "notes": "Knowledge / decision recall.", "intent_label": "conversation_lookup"}
+{"query": "What were the open questions from last sprint review?", "pattern_id": 6, "notes": "Knowledge / meeting notes recall.", "intent_label": "conversation_lookup"}
+{"query": "What was the conclusion on the hiring pipeline plan?", "pattern_id": 6, "notes": "Knowledge / past-decision lookup.", "intent_label": "conversation_lookup"}
+{"query": "What feedback did I get on the architecture proposal?", "pattern_id": 6, "notes": "Knowledge / commentary recall.", "intent_label": "conversation_lookup"}
+{"query": "Set aside an hour Thursday morning for deep work", "pattern_id": 7, "notes": "Implicit calendar block-out.", "intent_label": "action_items"}
+{"query": "Carve out 90 minutes Friday afternoon to write", "pattern_id": 7, "notes": "Implicit calendar block.", "intent_label": "action_items"}
+{"query": "Show me which calendars are connected", "pattern_id": 7, "notes": "Capability/configuration query.", "intent_label": "capability_check"}
+{"query": "Which inboxes does Pepper currently read?", "pattern_id": 7, "notes": "Capability/configuration query.", "intent_label": "capability_check"}
+{"query": "Which data sources are wired into Pepper right now?", "pattern_id": 7, "notes": "Capability/configuration query.", "intent_label": "capability_check"}
+{"query": "Am I on track for my fitness goals this quarter?", "pattern_id": 8, "notes": "Planning synthesis across sources.", "intent_label": "cross_source_triage"}
+{"query": "Should I be worried about anything happening this week?", "pattern_id": 8, "notes": "Open-ended planning synthesis.", "intent_label": "cross_source_triage"}
+{"query": "Give me a sense of how the week is shaping up", "pattern_id": 8, "notes": "Planning synthesis.", "intent_label": "cross_source_triage"}
+{"query": "Where am I behind right now and what should I focus on?", "pattern_id": 8, "notes": "Planning prioritisation.", "intent_label": "cross_source_triage"}
+{"query": "Anything I'm forgetting that I should follow up on?", "pattern_id": 8, "notes": "Planning omission check.", "intent_label": "cross_source_triage"}
+{"query": "What's the biggest thing on my plate I haven't addressed?", "pattern_id": 8, "notes": "Planning / open-action surfacing.", "intent_label": "action_items"}
+{"query": "Anything brewing that I should pack for next week?", "pattern_id": 10, "notes": "Multi-source: calendar + email travel detection.", "intent_label": "cross_source_triage"}
+{"query": "Pull together my prep for the upcoming Boston trip", "pattern_id": 10, "notes": "Multi-source travel prep.", "intent_label": "cross_source_triage"}
+{"query": "What should I be aware of before this week's family weekend?", "pattern_id": 10, "notes": "Multi-source synthesis.", "intent_label": "cross_source_triage"}
+{"query": "Help me prep for tomorrow's day", "pattern_id": 10, "notes": "Daily prep multi-source.", "intent_label": "cross_source_triage"}
+{"query": "Give me a heads-up on anything I'd want to know for tonight", "pattern_id": 10, "notes": "Same-day prep synthesis.", "intent_label": "cross_source_triage"}
+{"query": "What action items are open right now?", "pattern_id": 0, "notes": "Generic action surface.", "intent_label": "action_items"}
+{"query": "Pull up any outstanding to-dos", "pattern_id": 0, "notes": "Generic open-actions.", "intent_label": "action_items"}
+{"query": "Tell me what is unfinished from this week", "pattern_id": 0, "notes": "Time-bound open actions.", "intent_label": "action_items"}
+{"query": "What did I commit to that I haven't done yet?", "pattern_id": 0, "notes": "Open commitments.", "intent_label": "action_items"}
+{"query": "search the web for the latest trending shows on Netflix", "pattern_id": 11, "notes": "Explicit web search request — must route to call_tools so search_web fires.", "intent_label": "web_lookup"}
+{"query": "google what time the Warriors game starts tonight", "pattern_id": 11, "notes": "Explicit google verb — live data.", "intent_label": "web_lookup"}
+{"query": "look up the current price of Bitcoin", "pattern_id": 11, "notes": "Live financial data, owner-personalized but external.", "intent_label": "web_lookup"}
+{"query": "what's the weather in Boston tomorrow", "pattern_id": 11, "notes": "Weather → external lookup.", "intent_label": "web_lookup"}
+{"query": "find out who won the game last night", "pattern_id": 11, "notes": "Sports score live data.", "intent_label": "web_lookup"}
+{"query": "search online for restaurants near Harvard Square", "pattern_id": 11, "notes": "Explicit search verb + external data.", "intent_label": "web_lookup"}
+{"query": "look it up for me — what time does the Apple store close?", "pattern_id": 11, "notes": "\"Look it up\" + business hours = web search.", "intent_label": "web_lookup"}
+{"query": "what's trending on Twitter right now", "pattern_id": 11, "notes": "Trending + right now = live data lookup.", "intent_label": "web_lookup"}
+{"query": "can you check online for the latest iOS update", "pattern_id": 11, "notes": "\"Check online\" — explicit external lookup.", "intent_label": "web_lookup"}
+{"query": "find me recent news on AI regulation", "pattern_id": 11, "notes": "News + recent = web.", "intent_label": "web_lookup"}

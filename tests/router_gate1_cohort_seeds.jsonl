@@ -1,0 +1,12 @@
+{"query": "Any tasks from my email I need to handle?", "pattern_id": "gate1-action-items-email", "notes": "Email-scoped action items. Phase 2 Gate 1 cohort: action_items deferred to unknown, regex confidence >=0.9.", "intent_label": "action_items"}
+{"query": "What to-dos came in via email today?", "pattern_id": "gate1-action-items-email", "notes": "Phrasing variant of email-scoped action items pattern.", "intent_label": "action_items"}
+{"query": "Any deliverables waiting in my work email?", "pattern_id": "gate1-action-items-email", "notes": "Email-scoped action items, work scope variant.", "intent_label": "action_items"}
+{"query": "What did people ask me to do via email?", "pattern_id": "gate1-action-items-email", "notes": "Email-scoped action items, indirect phrasing.", "intent_label": "action_items"}
+{"query": "Pull up email action items from this week", "pattern_id": "gate1-action-items-email", "notes": "Time-scoped action items from inbox.", "intent_label": "action_items"}
+{"query": "Anything in email I haven't replied to that needs action?", "pattern_id": "gate1-action-items-email", "notes": "Inbox-scoped commitment-tracking variant.", "intent_label": "action_items"}
+{"query": "Quick rundown of overnight emails, flag anything important", "pattern_id": "gate1-overnight-triage", "notes": "Phase 2 Gate 1 cohort: cross_source_triage deferred to unknown. Importance flag distinguishes from plain inbox_summary.", "intent_label": "cross_source_triage"}
+{"query": "What came in via email overnight that I should know about?", "pattern_id": "gate1-overnight-triage", "notes": "Awareness query implies triage rather than dump.", "intent_label": "cross_source_triage"}
+{"query": "Any urgent emails from last night I need to act on?", "pattern_id": "gate1-overnight-triage", "notes": "Urgency + action implies triage.", "intent_label": "cross_source_triage"}
+{"query": "Summarize my morning emails and call out anything urgent", "pattern_id": "gate1-overnight-triage", "notes": "Summary + urgency surfacing = triage, not raw inbox dump.", "intent_label": "cross_source_triage"}
+{"query": "Did anything important hit my inbox while I was away?", "pattern_id": "gate1-overnight-triage", "notes": "Importance-filtered inbox check = triage.", "intent_label": "cross_source_triage"}
+{"query": "Any high-priority emails from this morning I need to see?", "pattern_id": "gate1-overnight-triage", "notes": "Priority filter on inbox = triage.", "intent_label": "cross_source_triage"}

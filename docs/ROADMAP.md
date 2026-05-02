@@ -35,7 +35,7 @@ Detailed plan: [AUTH_LIFECYCLE_PLAN.md](AUTH_LIFECYCLE_PLAN.md).
 ## Phase 0 — Life Context (Before Any Code)
 
 **Duration**: 1–2 sessions of honest reflection
-**Output**: A rich, honest `LIFE_CONTEXT.md` that Pepper can use as its ground truth
+**Output**: A rich, honest `data/life_context.md` that Pepper can use as its ground truth
 
 This is the most important work. Before any software is useful, Pepper needs to know:
 
@@ -46,7 +46,7 @@ This is the most important work. Before any software is useful, Pepper needs to 
 - What "a good week" looks like
 - Your patterns — how you make decisions, where you get stuck
 
-See [LIFE_CONTEXT.md.example](LIFE_CONTEXT.md.example) for the annotated template. Copy it to `LIFE_CONTEXT.md` and fill it in.
+See [LIFE_CONTEXT.md.example](LIFE_CONTEXT.md.example) for the annotated template. Copy it to `data/life_context.md` and fill it in. The live file lives under `data/` (user-mutable state, gitignored), not `docs/` (project documentation, read-only at runtime).
 
 **Success criterion**: You can hand this document to a thoughtful stranger and they could give you genuinely useful advice about your life.
 

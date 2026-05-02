@@ -1,14 +1,16 @@
-"""Phase 4 skill system: load, match, and inject structured workflow skills.
+"""Lazy-load skill system.
 
-Skills are SKILL.md files in the skills/ directory. Each file has YAML
-frontmatter (name, description, triggers, tools, model, version) followed by
-a markdown workflow body.
+Skills are markdown files with YAML frontmatter (name, description, version,
+optional references). Two layouts are supported:
 
-On each user turn, the SkillMatcher finds skills whose trigger phrases appear
-in the message and injects their content into the system prompt as fenced
-<skill> blocks. The model treats these as guidance, not user input.
+  skills/<name>/SKILL.md     — folder form, may include sibling references/*.md
+  skills/<name>.md           — flat form, kept for back-compat
 
-Skills are opt-in: if no skill matches, Pepper reasons from scratch.
+On every turn, Pepper appends a one-line index of installed skills to the
+system prompt. The model decides when a skill is relevant and calls the
+`skill_view` tool to load the body (progressive disclosure). The old
+trigger-phrase matcher and model-tier upgrade have been removed; see
+docs/SKILLS.md for the full rationale.
 """
 
 from __future__ import annotations
@@ -21,7 +23,6 @@ import structlog
 
 logger = structlog.get_logger()
 
-# Skills directory: skills/ at the repo root (parent of agent/)
 _SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
@@ -31,15 +32,14 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 class Skill:
     name: str
     description: str
-    triggers: list[str]
-    tools: list[str]
-    model: str          # "local" | "frontier"
     version: int
-    content: str        # Workflow body (no frontmatter)
-    path: Path
+    content: str            # SKILL.md body, frontmatter stripped
+    path: Path              # SKILL.md file (or flat .md)
+    references: list[str] = field(default_factory=list)  # sibling markdown files
+    root: Path | None = None   # folder root for folder-form skills; None for flat
 
 
-def _parse_frontmatter(raw: str) -> tuple[dict, str]:
+def parse_frontmatter(raw: str) -> tuple[dict, str]:
     """Split raw text into (frontmatter_dict, body).
 
     Returns ({}, raw) if the file has no valid --- delimiters.
@@ -52,28 +52,21 @@ def _parse_frontmatter(raw: str) -> tuple[dict, str]:
     body = match.group(2).strip()
 
     try:
-        import yaml  # pyyaml — declared in pyproject.toml
+        import yaml
         fm = yaml.safe_load(fm_text) or {}
     except Exception:
-        # Fallback: minimal parser that handles both scalar and list values.
-        # Covers the exact frontmatter shape used by all skill files:
-        #   key: scalar_value
-        #   list_key:
-        #     - item one
-        #     - item two
-        fm: dict = {}
+        # Fallback minimal parser: handles `key: scalar` and indented `- item` lists.
+        fm = {}
         current_list_key: str | None = None
         for line in fm_text.splitlines():
             stripped = line.rstrip()
             if not stripped:
                 continue
-            # List item (indented dash)
             if stripped.lstrip().startswith("- "):
                 if current_list_key is not None:
                     item = stripped.lstrip().removeprefix("- ").strip()
                     fm.setdefault(current_list_key, []).append(item)
                 continue
-            # Key-value line (no leading whitespace)
             if ":" in stripped and not stripped.startswith(" "):
                 current_list_key = None
                 k, _, v = stripped.partition(":")
@@ -82,21 +75,20 @@ def _parse_frontmatter(raw: str) -> tuple[dict, str]:
                 if v:
                     fm[k] = v
                 else:
-                    # No inline value — next indented dash lines are list items
                     current_list_key = k
 
     return fm, body
 
 
-def _load_skill(path: Path) -> Skill | None:
-    """Parse and validate a single skill file. Returns None on any error."""
+def _load_skill(path: Path, root: Path | None = None) -> Skill | None:
+    """Parse and validate a single SKILL.md file. Returns None on any error."""
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as e:
         logger.warning("skill_read_failed", path=str(path), error=str(e))
         return None
 
-    fm, body = _parse_frontmatter(raw)
+    fm, body = parse_frontmatter(raw)
 
     name = fm.get("name", "")
     if not name:
@@ -107,30 +99,34 @@ def _load_skill(path: Path) -> Skill | None:
         logger.warning("skill_empty_body", name=name, path=str(path))
         return None
 
-    triggers = fm.get("triggers") or []
-    if isinstance(triggers, str):
-        triggers = [triggers]
+    references = fm.get("references") or []
+    if isinstance(references, str):
+        references = [references]
+    references = [str(r) for r in references if r and str(r).endswith(".md")]
 
-    tools = fm.get("tools") or []
-    if isinstance(tools, str):
-        tools = [tools]
+    try:
+        version = int(fm.get("version", 1))
+    except (TypeError, ValueError):
+        version = 1
 
     return Skill(
         name=str(name),
         description=str(fm.get("description", "")),
-        triggers=[str(t).lower().strip() for t in triggers if t],
-        tools=[str(t) for t in tools if t],
-        model=str(fm.get("model", "local")),
-        version=int(fm.get("version", 1)),
+        version=version,
         content=body,
         path=path,
+        references=references,
+        root=root,
     )
 
 
 def load_skills(skills_dir: Path | None = None) -> list[Skill]:
-    """Load all *.md files from the skills directory.
+    """Load all skills from a directory.
 
+    Walks both `<name>/SKILL.md` (folder form) and top-level `*.md` (flat form).
     Skips files that fail validation with a warning — never crashes startup.
+    Local installs override registry skills only at the call site; this loader
+    just reads one directory.
     """
     directory = skills_dir or _SKILLS_DIR
     if not directory.exists():
@@ -138,101 +134,203 @@ def load_skills(skills_dir: Path | None = None) -> list[Skill]:
         return []
 
     skills: list[Skill] = []
+    seen_names: set[str] = set()
+
+    # Folder form: <name>/SKILL.md
+    for entry in sorted(directory.iterdir()):
+        if not entry.is_dir():
+            continue
+        skill_md = entry / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        skill = _load_skill(skill_md, root=entry)
+        if skill is None:
+            logger.warning("skill_load_skipped", path=str(skill_md))
+            continue
+        if skill.name in seen_names:
+            logger.warning("skill_name_collision", name=skill.name, path=str(skill_md))
+            continue
+        skills.append(skill)
+        seen_names.add(skill.name)
+        logger.info("skill_loaded", name=skill.name, version=skill.version, layout="folder")
+
+    # Flat form: top-level *.md
     for path in sorted(directory.glob("*.md")):
-        skill = _load_skill(path)
-        if skill is not None:
-            skills.append(skill)
-            logger.info(
-                "skill_loaded",
-                name=skill.name,
-                version=skill.version,
-                triggers=skill.triggers[:3],
-                tools=skill.tools[:5],
-            )
-        else:
+        skill = _load_skill(path, root=None)
+        if skill is None:
             logger.warning("skill_load_skipped", path=str(path))
+            continue
+        if skill.name in seen_names:
+            logger.warning("skill_name_collision", name=skill.name, path=str(path))
+            continue
+        skills.append(skill)
+        seen_names.add(skill.name)
+        logger.info("skill_loaded", name=skill.name, version=skill.version, layout="flat")
 
     logger.info("skills_loaded", count=len(skills))
     return skills
 
 
-def validate_skills_against_tools(skills: list[Skill], available_tools: set[str]) -> None:
-    """Log a warning for each skill that declares a tool not in available_tools.
+def sync_repo_skills_to_user_dir(
+    user_dir: Path | None = None,
+    repo_dir: Path | None = None,
+) -> dict[str, int]:
+    """Mirror repo skills into the user dir so the bind-mounted ~/.pepper sees them.
 
-    Skills are never disabled — this is advisory only. A missing tool will
-    produce a tool-not-found error at runtime, which the model handles gracefully.
+    The repo (`./skills/`) is the deployment artifact — the canonical source of
+    truth shipped with each release. The user dir (`~/.pepper/skills/`) is the
+    runtime location bind-mounted into the container. On every boot we copy
+    repo → user so a `git pull && docker compose restart` is enough to deploy
+    skill changes; nothing manual.
+
+    For each skill in the repo (flat or folder form), writes
+    `~/.pepper/skills/<name>/SKILL.md` (always folder form in the user dir).
+    Folder-form repo skills also get their sibling files mirrored.
+
+    Idempotent: only writes when content actually differs. Never touches
+    user-installed skills that have no repo counterpart (those came from
+    `skill_install` against external registries and must be preserved).
+
+    Returns a counter dict: {"created": N, "updated": N, "unchanged": N}.
     """
-    for skill in skills:
-        missing = [t for t in skill.tools if t and t not in available_tools]
-        if missing:
-            logger.warning(
-                "skill_declared_tools_unavailable",
-                name=skill.name,
-                missing_tools=missing,
-            )
+    repo = repo_dir or _SKILLS_DIR
+    user = user_dir or (Path.home() / ".pepper" / "skills")
+
+    counts = {"created": 0, "updated": 0, "unchanged": 0}
+
+    if not repo.exists():
+        logger.info("skill_sync_skipped", reason="repo_dir_missing", path=str(repo))
+        return counts
+
+    user.mkdir(parents=True, exist_ok=True)
+
+    # Collect (name, source_path, source_root_or_None) tuples from the repo.
+    # Folder form first so it wins over a stale flat sibling with the same name.
+    sources: list[tuple[str, Path, Path | None]] = []
+    seen: set[str] = set()
+
+    for entry in sorted(repo.iterdir()):
+        if entry.is_dir():
+            skill_md = entry / "SKILL.md"
+            if skill_md.exists() and entry.name not in seen:
+                sources.append((entry.name, skill_md, entry))
+                seen.add(entry.name)
+
+    for path in sorted(repo.glob("*.md")):
+        name = path.stem
+        if name not in seen:
+            sources.append((name, path, None))
+            seen.add(name)
+
+    for name, src_md, src_root in sources:
+        try:
+            target_dir = user / name
+            target_md = target_dir / "SKILL.md"
+            new_content = src_md.read_text(encoding="utf-8")
+
+            if not target_md.exists():
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_md.write_text(new_content, encoding="utf-8")
+                counts["created"] += 1
+                logger.info("skill_sync_created", name=name)
+            elif target_md.read_text(encoding="utf-8") != new_content:
+                target_md.write_text(new_content, encoding="utf-8")
+                counts["updated"] += 1
+                logger.info("skill_sync_updated", name=name)
+            else:
+                counts["unchanged"] += 1
+
+            # Mirror sibling files for folder-form skills (e.g. references/*.md).
+            if src_root is not None:
+                for src_file in src_root.rglob("*"):
+                    if not src_file.is_file() or src_file == src_md:
+                        continue
+                    rel = src_file.relative_to(src_root)
+                    dst = target_dir / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if not dst.exists() or dst.read_bytes() != src_file.read_bytes():
+                        dst.write_bytes(src_file.read_bytes())
+                        logger.info("skill_sync_asset", name=name, asset=str(rel))
+        except OSError as e:
+            logger.warning("skill_sync_failed", name=name, error=str(e))
+
+    logger.info("skill_sync_done", **counts)
+    return counts
 
 
-class SkillMatcher:
-    """Matches user messages to skills and injects workflow guidance into prompts.
+def load_all_skills(
+    user_dir: Path | None = None,
+    repo_dir: Path | None = None,
+) -> list[Skill]:
+    """Load installed skills from both ~/.pepper/skills and the repo skills dir.
 
-    Matching uses a fast literal-substring path on lowercased trigger phrases.
-    Semantic similarity via pgvector is deferred — trigger coverage is sufficient
-    for the initial skill library and can be layered in when needed.
+    User-installed skills (~/.pepper/skills) take precedence over repo skills
+    on name collision — local install always wins.
     """
+    user = user_dir or (Path.home() / ".pepper" / "skills")
+    repo = repo_dir or _SKILLS_DIR
 
-    def __init__(self, skills: list[Skill]) -> None:
-        self._skills = skills
+    user_skills = load_skills(user) if user.exists() else []
+    repo_skills = load_skills(repo) if repo.exists() else []
 
-    @property
-    def skills(self) -> list[Skill]:
-        return self._skills
+    seen = {s.name for s in user_skills}
+    merged = list(user_skills)
+    for s in repo_skills:
+        if s.name in seen:
+            logger.info("skill_repo_shadowed_by_user", name=s.name)
+            continue
+        merged.append(s)
+        seen.add(s.name)
 
-    def match(self, user_message: str, top_n: int = 3) -> list[Skill]:
-        """Return up to top_n skills whose trigger phrases appear in the message.
+    return merged
 
-        Scored by number of distinct triggers matched; ties broken alphabetically.
-        Returns [] when no skills are loaded or none match.
-        """
-        if not self._skills:
-            return []
 
-        lower = user_message.lower()
-        scored: list[tuple[int, str, Skill]] = []
+def build_index(skills: list[Skill]) -> str:
+    """Render a compact one-line-per-skill index for system-prompt injection.
 
-        for skill in self._skills:
-            hits = sum(1 for trigger in skill.triggers if trigger and trigger in lower)
-            if hits > 0:
-                scored.append((hits, skill.name, skill))
+    Returns the empty string when no skills are loaded — callers should not
+    inject in that case.
+    """
+    if not skills:
+        return ""
 
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        return [s for _, _, s in scored[:top_n]]
+    lines = ["Available skills:"]
+    for s in sorted(skills, key=lambda x: x.name):
+        desc = s.description.strip().replace("\n", " ")
+        if len(desc) > 160:
+            desc = desc[:157] + "..."
+        lines.append(f"- {s.name} — {desc}" if desc else f"- {s.name}")
 
-    def inject_into_prompt(
-        self,
-        system_prompt: str,
-        user_message: str,
-        top_n: int = 3,
-    ) -> str:
-        """Append matched skill blocks to the system prompt.
+    lines.append("")
+    lines.append(
+        "Use skill_view(name) to load a skill's full instructions when one is "
+        "relevant. Use skill_search(query) to find skills not yet installed."
+    )
+    return "\n".join(lines)
 
-        Each skill is wrapped in <skill name="...">...</skill> tags so the model
-        treats the content as structured guidance rather than user input.
 
-        Returns system_prompt unchanged if no skills match.
-        """
-        matched = self.match(user_message, top_n=top_n)
-        if not matched:
-            return system_prompt
+def read_skill_reference(skill: Skill, ref: str) -> str | None:
+    """Return the contents of a sibling markdown reference, or None.
 
-        logger.info(
-            "skills_matched",
-            count=len(matched),
-            names=[s.name for s in matched],
-            message_preview=user_message[:80],
-        )
-
-        blocks = [
-            f'<skill name="{skill.name}">\n{skill.content}\n</skill>'
-            for skill in matched
-        ]
-        return system_prompt + "\n\n" + "\n\n".join(blocks)
+    Refuses paths that escape the skill folder, non-markdown files, and any
+    reference not declared in the skill's frontmatter.
+    """
+    if skill.root is None:
+        return None
+    if not ref.endswith(".md"):
+        return None
+    if ref not in skill.references:
+        return None
+    target = (skill.root / ref).resolve()
+    try:
+        target.relative_to(skill.root.resolve())
+    except ValueError:
+        logger.warning("skill_ref_escape_attempt", skill=skill.name, ref=ref)
+        return None
+    if not target.exists() or not target.is_file():
+        return None
+    try:
+        return target.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("skill_ref_read_failed", skill=skill.name, ref=ref, error=str(e))
+        return None

@@ -1,0 +1,4 @@
+{"query": "Should I book a long weekend in Tahoe with the boys?", "pattern_id": "general-speculative-plan", "notes": "Speculative \"should I plan\" trip framing; mirrors travel-04/family-10 phrasing without overlapping their entities.", "intent_label": "general_chat"}
+{"query": "Is it worth taking the kids to Yosemite this fall?", "pattern_id": "general-speculative-plan", "notes": "\"Is it worth\" advisory question on personal planning; reflective not transactional.", "intent_label": "general_chat"}
+{"query": "What's the drive time from Mountain View to Tahoe on a Friday afternoon?", "pattern_id": "general-drive-time", "notes": "Direct travel-time estimate; mirrors travel-05 surface form with fresh entities.", "intent_label": "general_chat"}
+{"query": "How long does it usually take to get to SFO during morning rush?", "pattern_id": "general-drive-time", "notes": "Drive-time question; non-personal-data lookup.", "intent_label": "general_chat"}

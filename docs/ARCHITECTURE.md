@@ -93,7 +93,7 @@ The most important data structure in the system. A living document containing:
 - Family member profiles (relationships, dynamics, needs)
 - Professional context (current work, key relationships, priorities)
 
-This is Pepper's ground truth. All proactive recommendations are filtered through it. See [LIFE_CONTEXT.md](LIFE_CONTEXT.md) for the template and maintenance process.
+This is Pepper's ground truth. All proactive recommendations are filtered through it. The live document lives at `data/life_context.md` (gitignored, mutable — Pepper writes back to it via the `update_life_context` tool, and every change appends a `LifeContextVersion` row in Postgres). The annotated template lives at [LIFE_CONTEXT.md.example](LIFE_CONTEXT.md.example).
 
 ### Persistent Memory
 
@@ -214,6 +214,7 @@ This contract means any subsystem can be replaced without modifying Pepper Core.
 - **Parallel tool execution** (`agent/tool_router.py`) — read-only tools dispatched concurrently via `asyncio.gather`; side-effect tools execute sequentially in model-produced order
 - **Context compression** (`agent/context_compressor.py`) — auto-compresses long conversations before hitting the model's context window; always runs on local Ollama (privacy invariant enforced)
 - **Error classifier + smart fallback** (`agent/error_classifier.py`) — typed `ErrorCategory` / `DataSensitivity` error handling; classified retry loop; privacy invariant preserved under all failure modes
+- **Semantic intent router** (`agent/semantic_router.py`) — Phase 3 cutover (2026-04-29): k-NN intent classifier over per-intent exemplar embeddings (`qwen3-embedding:0.6b`, pgvector HNSW). Primary router; legacy regex `agent/query_router.py` runs in shadow alongside it (writes to `routing_events.shadow_decision_*`) until Phase 5 cleanup removes the codepath. Capability-registry filtering applied as a deterministic post-route step. Pre-commit eval gate (`scripts/git-hooks/pre-commit-router-eval`, ≥85% on `tests/router_eval_set.jsonl`) gates router-relevant edits. See `docs/SEMANTIC_ROUTER.md` for operating details.
 
 ### SKILL SYSTEM (Phase 4) — ✅ Complete
 

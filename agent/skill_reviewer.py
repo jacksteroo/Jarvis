@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from agent.skills import _parse_frontmatter
+from agent.skills import parse_frontmatter
 
 import structlog
 
@@ -64,6 +64,10 @@ class SkillReviewer:
         self._llm = llm_client
         self._skills: dict[str, Any] = {s.name: s for s in (skills or [])}
         self._config = config
+
+    def set_skills(self, skills_by_name: dict[str, Any]) -> None:
+        """Atomically swap the reviewer's skill lookup. Called after install."""
+        self._skills = skills_by_name
 
     async def review_turn(
         self,
@@ -183,7 +187,7 @@ class SkillReviewer:
 
         try:
             raw = skill.path.read_text(encoding="utf-8")
-            _, current_body = _parse_frontmatter(raw)
+            _, current_body = parse_frontmatter(raw)
 
             # Ask the local LLM to apply the improvement to the workflow body.
             # Always local-only: the raw skill content and improvement notes are

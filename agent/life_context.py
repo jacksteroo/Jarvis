@@ -48,7 +48,7 @@ def load_life_context(path: str) -> str:
 
 def get_life_context_sections(path: str = None) -> dict[str, str]:
     """Parse markdown ## headings as section keys, content as values."""
-    resolved_path = path or "docs/LIFE_CONTEXT.md"
+    resolved_path = path or "data/life_context.md"
     content = load_life_context(resolved_path)
     if not content:
         return {}
@@ -83,7 +83,7 @@ def get_owner_name(path: str = None, config=None) -> str:
         if cleaned and cleaned.lower() != "the owner":
             return cleaned
 
-    resolved_path = path or "docs/LIFE_CONTEXT.md"
+    resolved_path = path or "data/life_context.md"
     sections = get_life_context_sections(resolved_path)
     identity = sections.get("Identity", "")
 
@@ -114,7 +114,7 @@ async def update_life_context(
     """
     from agent.models import LifeContextVersion
 
-    resolved_path = path or "docs/LIFE_CONTEXT.md"
+    resolved_path = path or "data/life_context.md"
     file_path = Path(resolved_path)
     original = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
 
@@ -223,6 +223,9 @@ def build_capability_block(registry: "CapabilityRegistry | None" = None) -> str:
         f"- Images{web_note}: display photos directly in Telegram via search_images — "
         "when asked for a photo or image of any person/place/thing, call search_images "
         "and embed the first result as [IMAGE:url] in your response, then add a sentence of context",
+        "- Health / Wearables: NOT CONNECTED — no access to Oura, Garmin, Whoop, or Apple Health data. "
+        "When asked about sleep, activity, recovery, or biometrics, say clearly that health data is not "
+        "yet integrated and do not infer or guess any health metrics.",
     ]
     return "\n".join(lines)
 
@@ -244,7 +247,7 @@ def build_system_prompt(life_context_path: str = None, config=None,
                         capability_registry: "CapabilityRegistry | None" = None) -> str:
     """Build the full Pepper system prompt: soul + schedule + capabilities + life context."""
     soul = load_soul()
-    context = load_life_context(life_context_path or "docs/LIFE_CONTEXT.md")
+    context = load_life_context(life_context_path or "data/life_context.md")
     # Sanitize stale past-deadline phrases so the model never sees them in the
     # system prompt (the same pattern is applied to injected context blocks in
     # core.py; applying it here ensures consistency across both code paths).
@@ -254,7 +257,7 @@ def build_system_prompt(life_context_path: str = None, config=None,
         context,
         flags=re.IGNORECASE,
     )
-    owner_name = get_owner_name(life_context_path or "docs/LIFE_CONTEXT.md", config)
+    owner_name = get_owner_name(life_context_path or "data/life_context.md", config)
     logger.info(
         "system_prompt_built",
         life_context_chars=len(context),
@@ -283,6 +286,8 @@ Your automated schedule (runs inside your process — always on while the contai
 {capability_block}
 
 IMPORTANT: When asked if you can read iMessages, WhatsApp, email, calendar, or mounted local files — the answer is YES, you have tools for all of these. Attempt the tool call. If the data source is unavailable (e.g. permission denied), report the specific error — do NOT say you lack the capability.
+
+IMPORTANT: Health and biometric data (sleep, activity, recovery, heart rate, wearables — Oura, Garmin, Whoop, Apple Health) is NOT connected and has NEVER been connected. When asked about health metrics, say clearly: "Health data isn't integrated yet — I can't see wearable or biometric data." Do NOT say data was "previously shared", "previously connected", or "previously available". Do NOT guess or infer any health metrics.
 
 Your owner's life context:
 ---

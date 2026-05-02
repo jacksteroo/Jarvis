@@ -24,7 +24,9 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
 ]
 
 CONFIG_DIR = Path.home() / ".config" / "pepper"
