@@ -42,6 +42,6 @@ backups/router/*.sql
 # the user's actual memory). The committed `.example.jsonl` is the template;
 # the populated `retrieval_eval_set.jsonl` stays local.
 agent/tests/retrieval_eval_set.jsonl
-# Local-only baseline JSON; aggregate markdown reports may be committed
-# (they don't contain queries).
-eval_results/baseline.json
+# `eval_results/baseline.json` is committable — it holds aggregate metrics
+# only (Recall@K, MRR, per-category averages) which are non-personal by
+# construction. Committing it lets `--mode gate` be checkable from the repo.
