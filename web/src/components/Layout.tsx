@@ -1,7 +1,7 @@
 import { ReactNode } from 'react'
 import { logInfo } from '../logger'
 
-type Tab = 'chat' | 'status' | 'context' | 'relationships'
+type Tab = 'chat' | 'status' | 'context' | 'relationships' | 'traces'
 
 interface Props {
   tab: Tab
@@ -68,7 +68,7 @@ export default function Layout({ tab, onTabChange, children }: Props) {
         <span style={styles.logo}>Pepper</span>
         <span style={styles.dot} title="online" />
         <nav style={styles.tabs}>
-          {(['chat', 'status', 'context', 'relationships'] as Tab[]).map((t) => (
+          {(['chat', 'status', 'context', 'relationships', 'traces'] as Tab[]).map((t) => (
             <button
               key={t}
               style={styles.tab(tab === t)}
@@ -77,7 +77,15 @@ export default function Layout({ tab, onTabChange, children }: Props) {
                 onTabChange(t)
               }}
             >
-              {t === 'chat' ? 'Chat' : t === 'status' ? 'Status' : t === 'context' ? 'Life Context' : 'Relationships'}
+              {t === 'chat'
+                ? 'Chat'
+                : t === 'status'
+                ? 'Status'
+                : t === 'context'
+                ? 'Life Context'
+                : t === 'relationships'
+                ? 'Relationships'
+                : 'Traces'}
             </button>
           ))}
         </nav>

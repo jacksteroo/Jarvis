@@ -69,6 +69,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Epic 01 (#24) — /traces endpoint and detail view. The router carries
+# its own auth guards (require_api_key + localhost bind enforcement).
+from agent.traces.http import router as _traces_router  # noqa: E402
+
+app.include_router(_traces_router, prefix="/api")
+
 
 class ChatRequest(BaseModel):
     message: str
