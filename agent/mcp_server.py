@@ -56,6 +56,11 @@ NEVER_EXPOSE = frozenset({
     "get_recent_emails", "search_emails",
     "search_slack", "get_slack_channel_messages",
     "search_memory", "save_memory",
+    # Trace substrate (Epic 01 #25) — every trace row contains the full
+    # input/output/tool_call args of a turn. Forward-defends future MCP
+    # exposure of the in-process /traces route (#24).
+    "query_traces", "get_trace", "search_traces",
+    "find_similar_traces", "get_trace_by_id", "list_traces",
     # Write side-effects — require user approval, must never be exposed externally
     "update_life_context",
     "mark_commitment_complete",
