@@ -54,6 +54,15 @@ RAW_PERSONAL_TOOLS = frozenset({
     "search_slack", "get_slack_channel_messages",
     # Memory (may contain raw recalled content)
     "search_memory", "save_memory",
+    # Trace substrate (Epic 01 — #25). The trace store contains every
+    # turn's input + output + tool call args verbatim, so any future
+    # MCP tool that surfaces traces is RAW_PERSONAL and must never
+    # reach an external/trusted server. Names listed here are
+    # forward-defending: the #24 endpoint is in-process FastAPI today
+    # and not yet exposed as an MCP tool, but the classification must
+    # land before any such tool is named.
+    "query_traces", "get_trace", "search_traces",
+    "find_similar_traces", "get_trace_by_id", "list_traces",
 })
 
 # Tools that return structured but non-raw data — ok for trusted servers
