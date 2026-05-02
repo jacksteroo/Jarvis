@@ -149,6 +149,104 @@ class CalendarClient:
         return events
 
 
+    # ------------------------------------------------------------------
+    # Event creation (writable calendars only)
+    # ------------------------------------------------------------------
+
+    # Google Calendar accessRole values that allow event creation.
+    _WRITABLE_ROLES = {"owner", "writer"}
+
+    def list_writable_calendars(self) -> list[dict[str, Any]]:
+        """Subset of list_calendars() that the OAuth token can WRITE to.
+
+        Use this for picking which calendar to create an event under — for
+        example to distinguish the personal calendar from a 'Family shared'
+        calendar that the user owns or has been granted writer access to.
+        """
+        out = []
+        for cal in self.list_calendars(include_excluded=True):
+            if cal.get("accessRole") in self._WRITABLE_ROLES:
+                out.append({
+                    "id": cal.get("id"),
+                    "summary": cal.get("summary"),
+                    "description": cal.get("description", ""),
+                    "primary": bool(cal.get("primary")),
+                    "access_role": cal.get("accessRole"),
+                    "background_color": cal.get("backgroundColor"),
+                    "time_zone": cal.get("timeZone"),
+                })
+        return out
+
+    def create_event(
+        self,
+        *,
+        calendar_id: str,
+        summary: str,
+        start: str,
+        end: str,
+        time_zone: str | None = None,
+        description: str | None = None,
+        location: str | None = None,
+        attendees: list[str] | None = None,
+        all_day: bool = False,
+        send_updates: str = "none",
+    ) -> dict[str, Any]:
+        """Create an event on `calendar_id`.
+
+        Time formats:
+          - all_day=False: `start` and `end` must be RFC3339 strings
+            (e.g. '2026-05-12T15:00:00-07:00'). If you only have a naive
+            datetime, supply `time_zone` (e.g. 'America/Los_Angeles') and
+            pass start/end as 'YYYY-MM-DDTHH:MM:SS'.
+          - all_day=True: `start` and `end` are date-only ('YYYY-MM-DD').
+
+        send_updates: 'all' | 'externalOnly' | 'none' — whether to email
+        invitees. Defaults to 'none' so the user is never surprised.
+        """
+        if not calendar_id:
+            raise ValueError("calendar_id is required")
+        if not summary:
+            raise ValueError("summary is required")
+        if not start or not end:
+            raise ValueError("start and end are required")
+
+        if all_day:
+            start_field: dict[str, Any] = {"date": start}
+            end_field: dict[str, Any] = {"date": end}
+        else:
+            start_field = {"dateTime": start}
+            end_field = {"dateTime": end}
+            if time_zone:
+                start_field["timeZone"] = time_zone
+                end_field["timeZone"] = time_zone
+
+        body: dict[str, Any] = {
+            "summary": summary,
+            "start": start_field,
+            "end": end_field,
+        }
+        if description:
+            body["description"] = description
+        if location:
+            body["location"] = location
+        if attendees:
+            body["attendees"] = [{"email": a} for a in attendees if a]
+
+        created = (
+            self._service.events()
+            .insert(calendarId=calendar_id, body=body, sendUpdates=send_updates)
+            .execute()
+        )
+        return {
+            "id": created.get("id"),
+            "html_link": created.get("htmlLink"),
+            "calendar_id": calendar_id,
+            "summary": created.get("summary"),
+            "start": created.get("start"),
+            "end": created.get("end"),
+        }
+
+
 def _event_sort_key(event: dict[str, Any]) -> str:
     start = event.get("start", {})
     return start.get("dateTime") or start.get("date") or ""

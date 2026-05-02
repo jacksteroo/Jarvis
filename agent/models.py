@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Float, String, Text, func
+from sqlalchemy import ARRAY, BigInteger, DateTime, Float, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from agent.db import Base
@@ -51,6 +52,77 @@ class LifeContextVersion(Base):
     content: Mapped[str] = mapped_column(Text)
     change_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=func.now())
+
+
+class RoutingEvent(Base):
+    """One row per chat turn: the regex router's decision, the (future) shadow
+    semantic router's decision, the tools the LLM actually called, latency, and a
+    derived success-signal. Per docs/SEMANTIC_ROUTER_MIGRATION.md Phase 1.
+
+    Shadow columns (`shadow_decision_*`) are added now for forward-compat with
+    Phase 2; they remain NULL until the semantic classifier comes online.
+    """
+
+    __tablename__ = "routing_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    query_text: Mapped[str] = mapped_column(Text, nullable=False)
+    query_embedding: Mapped[Optional[list]] = mapped_column(Vector(1024), nullable=True)
+    regex_decision_intent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    regex_decision_sources: Mapped[Optional[list[str]]] = mapped_column(
+        ARRAY(Text), nullable=True
+    )
+    regex_decision_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    tools_actually_called: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    llm_model: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    success_signal: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
+    success_signal_set_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    shadow_decision_intent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    shadow_decision_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    user_session_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
+    # Outbound channel message coordinates — currently used to map Telegram
+    # message reactions back to the routing event so 👍/👎 lands as an
+    # explicit success_signal. NULL when the channel doesn't expose
+    # reactable message ids (e.g. the HTTP API).
+    outbound_chat_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    outbound_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+
+
+class RouterExemplar(Base):
+    """Labeled query → intent exemplar for the semantic router's k-NN.
+
+    Phase 2 of docs/SEMANTIC_ROUTER_MIGRATION.md. The bootstrap seed comes
+    in four tiers (`platinum`, `gold`, `silver`, `manual`); Phase 4 adds
+    real-time confirmed exemplars and nightly evictions on top.
+
+    Additive: evicted exemplars are timestamp-archived (`archived_at`
+    NOT NULL) rather than deleted, so historical analyses still see them.
+    """
+
+    __tablename__ = "router_exemplars"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    query_text: Mapped[str] = mapped_column(Text, nullable=False)
+    intent_label: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    tier: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    source_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    embedding: Mapped[Optional[list]] = mapped_column(Vector(1024), nullable=True)
+    confirmation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_confirmed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    archived_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
 
 class AuditLog(Base):

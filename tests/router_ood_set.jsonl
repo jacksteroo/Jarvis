@@ -1,0 +1,20 @@
+{"query": "asdfqwer poiu lkjh", "note": "keyboard mash"}
+{"query": "xyzzy plover frobnicate", "note": "classic nonce words"}
+{"query": "blarg blarg quux fnord", "note": "stacked nonce tokens"}
+{"query": "gleep glop schmoo blibber", "note": "phonetic gibberish"}
+{"query": "flibbertigibbet snickersnack jabberwocky", "note": "carrollian nonsense"}
+{"query": "wuv wuv pew pew zorp zorp", "note": "onomatopoeic mash"}
+{"query": "floccinaucinihilipilification antidisestablishmentarianism supercalifragilistic", "note": "long words with no actionable verb"}
+{"query": "mxyzptlk kltpzyxm mxyzptlk", "note": "unpronounceable repeats"}
+{"query": "snorgleblat fizzwiggle wugglehorn", "note": "compound nonce"}
+{"query": "kerblamo zonkitydoodah skadoosh", "note": "interjection-like"}
+{"query": "fweep fwoop frap glug", "note": "monosyllabic gibberish"}
+{"query": "bzzt krrk wheee tssk", "note": "machine noises"}
+{"query": "blibber blubber bobber bibber", "note": "alliterative nonsense"}
+{"query": "qwertyuiop asdfghjkl zxcvbnm", "note": "keyboard rows"}
+{"query": "trogdor burninating thatched-roof cottages", "note": "internet meme nonce"}
+{"query": "ph'nglui mglw'nafh cthulhu r'lyeh wgah'nagl", "note": "lovecraftian nonsense"}
+{"query": "hodor hodor hodor hodor hodor", "note": "single token repeats"}
+{"query": "yibble dibble fibble wibble nibble", "note": "rhyming nonsense"}
+{"query": "splork zonker quibblefax morgleflub", "note": "made-up nouns"}
+{"query": "1234567890 0987654321 1357924680 2468013579", "note": "digit sequences"}

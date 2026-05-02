@@ -86,6 +86,18 @@ Use vector search (pgvector) where the query is inherently fuzzy: "what have I s
 
 Mixing explicit and semantic retrieval in the right places is the skill. Default to explicit; add semantic where fuzziness is the feature.
 
+**Routing boundary clarification (Phase 3 cutover, 2026-04-29):** The
+top-level *intent* classifier (`agent/semantic_router.py`) is now semantic
+— a k-NN over per-intent exemplar embeddings (`qwen3-embedding:0.6b`,
+1024-dim, pgvector HNSW). The per-intent *slot extraction* (target source,
+time scope, entity targets, filesystem path) stays explicit / regex-based.
+This keeps the principle intact: fuzziness is the feature for "did the
+user mean schedule_lookup or person_lookup?" but explicit lookups still
+drive what gets fetched once the intent is known. Capability filtering
+(`agent.capability_registry`) is applied as a deterministic post-route
+step on the semantic router's output. See `docs/SEMANTIC_ROUTER.md` for
+operating details.
+
 ---
 
 ## 6. Risk Ladder for Autonomy

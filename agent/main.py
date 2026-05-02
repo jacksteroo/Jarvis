@@ -204,21 +204,20 @@ async def complete_commitment(memory_id: int):
 
 @app.get("/skills", dependencies=[Depends(require_api_key)])
 async def list_skills():
-    """List all loaded skills with their metadata."""
-    matcher = _get_pepper()._skill_matcher
+    """List all installed skills with their metadata."""
+    skills = _get_pepper()._skills
     return {
         "skills": [
             {
                 "name": s.name,
                 "description": s.description,
-                "triggers": s.triggers,
-                "tools": s.tools,
-                "model": s.model,
                 "version": s.version,
+                "references": s.references,
+                "path": str(s.path),
             }
-            for s in matcher.skills
+            for s in skills
         ],
-        "count": len(matcher.skills),
+        "count": len(skills),
     }
 
 

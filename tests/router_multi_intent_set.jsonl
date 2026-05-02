@@ -1,0 +1,30 @@
+{"query": "what's on my calendar today and any urgent emails", "expected_fragments": ["what's on my calendar today", "any urgent emails"], "note": "and-boundary, two intents"}
+{"query": "summarize my unread emails plus my calendar for tomorrow", "expected_fragments": ["summarize my unread emails", "my calendar for tomorrow"], "note": "plus-boundary"}
+{"query": "show me today's meetings; also any messages from Sarah", "expected_fragments": ["show me today's meetings", "also any messages from Sarah"], "note": "semicolon then also"}
+{"query": "what did Mike send me, what about Linda", "expected_fragments": ["what did Mike send me", "Linda"], "note": "comma + what-about"}
+{"query": "list my todos & schedule for the week", "expected_fragments": ["list my todos", "schedule for the week"], "note": "ampersand boundary"}
+{"query": "draft a reply to John as well as a calendar block at 3pm", "expected_fragments": ["draft a reply to John", "a calendar block at 3pm"], "note": "as-well-as boundary"}
+{"query": "any new emails? what about my calendar", "expected_fragments": ["any new emails", "my calendar"], "note": "question-mark + what-about"}
+{"query": "remind me to call mom then check my inbox", "expected_fragments": ["remind me to call mom", "check my inbox"], "note": "then boundary"}
+{"query": "whats on my plate today — and what did Anna text me", "expected_fragments": ["whats on my plate today", "what did Anna text me"], "note": "em-dash boundary"}
+{"query": "summarize unread mail\nshow today's events", "expected_fragments": ["summarize unread mail", "show today's events"], "note": "newline boundary"}
+{"query": "did sarah message me and is there anything urgent in email", "expected_fragments": ["did sarah message me", "is there anything urgent in email"], "note": "and boundary, both action-y"}
+{"query": "calendar for tomorrow plus action items from yesterday's standup", "expected_fragments": ["calendar for tomorrow", "action items from yesterday's standup"], "note": "plus boundary"}
+{"query": "check email; check whatsapp; check imessage", "expected_fragments": ["check email", "check whatsapp", "check imessage"], "note": "three-way semicolon"}
+{"query": "show me what mike said and what jane said and what john said", "expected_fragments": ["show me what mike said", "what jane said", "what john said"], "note": "three-way and"}
+{"query": "what's on my calendar today", "expected_fragments": ["what's on my calendar today"], "note": "singleton — no boundary"}
+{"query": "summarize my unread emails", "expected_fragments": ["summarize my unread emails"], "note": "singleton — no boundary"}
+{"query": "did Sarah send me anything", "expected_fragments": ["did Sarah send me anything"], "note": "singleton with possessive-like name"}
+{"query": "search for the email titled \"calendar and budget review\"", "expected_fragments": ["search for the email titled \"calendar and budget review\""], "note": "quoted-span guard — and inside quotes must NOT split"}
+{"query": "find the doc \"plus one rsvp\" please", "expected_fragments": ["find the doc \"plus one rsvp\" please"], "note": "quoted-span guard — plus inside quotes"}
+{"query": "what did dad's coworker email about", "expected_fragments": ["what did dad's coworker email about"], "note": "possessive must not split"}
+{"query": "remind me about Sara's birthday and add it to calendar", "expected_fragments": ["remind me about Sara's birthday", "add it to calendar"], "note": "possessive intact + and split"}
+{"query": "calendar today, emails today, todos today", "expected_fragments": ["calendar today, emails today, todos today"], "note": "bare commas should NOT split (singleton)"}
+{"query": "what's on my schedule for monday and tuesday", "expected_fragments": ["what's on my schedule for monday", "tuesday"], "note": "and boundary even when day-list-ish"}
+{"query": "morning brief", "expected_fragments": ["morning brief"], "note": "two-word singleton"}
+{"query": "send Bob a message that says \"hey are you free thursday and friday\"", "expected_fragments": ["send Bob a message that says \"hey are you free thursday and friday\""], "note": "quoted span across and"}
+{"query": "show emails from Linda; what's her phone number", "expected_fragments": ["show emails from Linda", "what's her phone number"], "note": "semicolon"}
+{"query": "are there any conflicts on my calendar this week and next week", "expected_fragments": ["are there any conflicts on my calendar this week", "next week"], "note": "and split on time range"}
+{"query": "what's the latest from operations as well as engineering", "expected_fragments": ["what's the latest from operations", "engineering"], "note": "as-well-as"}
+{"query": "i need to prep for the 3pm meeting then send the followup email", "expected_fragments": ["i need to prep for the 3pm meeting", "send the followup email"], "note": "then boundary"}
+{"query": "tldr my inbox", "expected_fragments": ["tldr my inbox"], "note": "short singleton"}

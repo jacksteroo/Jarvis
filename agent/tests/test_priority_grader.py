@@ -107,7 +107,7 @@ def _make_pepper_with_vips(vips):
     from unittest.mock import patch, MagicMock
     from agent.core import PepperCore
     config = MagicMock()
-    config.LIFE_CONTEXT_PATH = "docs/LIFE_CONTEXT.md"
+    config.LIFE_CONTEXT_PATH = "data/life_context.md"
     config.OWNER_NAME = "Test"
     config.TIMEZONE = "UTC"
     config.DEFAULT_LOCAL_MODEL = "x"

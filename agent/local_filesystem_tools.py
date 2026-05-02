@@ -47,7 +47,7 @@ FILESYSTEM_TOOLS = [
             "description": (
                 "Inspect a local mounted file or directory on this machine, read-only. "
                 "Use this for questions about paths like /data/messages, /data/whatsapp, "
-                "docs/LIFE_CONTEXT.md, or mounted repo files. It can list directory entries "
+                "data/life_context.md, or mounted repo files. It can list directory entries "
                 "or preview text files."
             ),
             "parameters": {

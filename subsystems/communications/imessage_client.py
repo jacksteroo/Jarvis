@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os as _os
 import sqlite3
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -246,6 +247,60 @@ def _get_unread_count_sync() -> int:
         conn.close()
 
 
+# AppleScript template for sending an iMessage. The {to} field accepts a phone
+# number, email, or chat GUID; the message body is double-quoted at template-
+# substitution time after escaping. Targeting a chat GUID lets us reply to
+# group chats as well as 1:1 conversations.
+_OSA_SEND_BUDDY = '''\
+tell application "Messages"
+    set targetService to 1st service whose service type = iMessage
+    set targetBuddy to buddy "{to}" of targetService
+    send "{body}" to targetBuddy
+end tell
+'''
+
+_OSA_SEND_CHAT = '''\
+tell application "Messages"
+    set targetChat to a reference to text chat id "{guid}"
+    send "{body}" to targetChat
+end tell
+'''
+
+
+def _osa_escape(s: str) -> str:
+    """Escape a string for safe interpolation inside an AppleScript double-quoted literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _send_imessage_sync(to: str, body: str, chat_guid: str | None = None) -> dict:
+    """Send an iMessage via osascript. Raises on subprocess failure.
+
+    If chat_guid is provided, target the existing chat (group or 1:1 by GUID).
+    Otherwise treat `to` as a phone number / email / handle.
+    """
+    if not body:
+        raise ValueError("iMessage body cannot be empty")
+    if chat_guid:
+        script = _OSA_SEND_CHAT.format(guid=_osa_escape(chat_guid), body=_osa_escape(body))
+    else:
+        if not to:
+            raise ValueError("iMessage recipient is required when chat_guid is not provided")
+        script = _OSA_SEND_BUDDY.format(to=_osa_escape(to), body=_osa_escape(body))
+
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"osascript send failed (exit {proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    logger.info("imessage_sent", to=(chat_guid or to)[:40], length=len(body))
+    return {"ok": True, "to": chat_guid or to, "length": len(body)}
+
+
 class IMessageClient:
     """Async wrapper around the local iMessage SQLite database."""
 
@@ -263,6 +318,10 @@ class IMessageClient:
 
     async def get_unread_count(self) -> int:
         return await asyncio.to_thread(_get_unread_count_sync)
+
+    async def send(self, to: str, body: str, chat_guid: str | None = None) -> dict:
+        """Send an iMessage. Either supply `to` (phone/email) or `chat_guid` (for groups)."""
+        return await asyncio.to_thread(_send_imessage_sync, to, body, chat_guid)
 
     @staticmethod
     def is_available() -> bool:

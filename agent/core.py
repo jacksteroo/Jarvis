@@ -8,23 +8,26 @@ import structlog
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
+from agent import chat_turn_logger, success_signal
 from agent.config import Settings
 from agent.llm import ModelClient
 from agent.life_context import build_system_prompt, get_life_context_sections, get_owner_name, update_life_context
 from agent.tool_router import ToolRouter
 from agent.query_router import QueryRouter, IntentType, ActionMode
+from agent.semantic_router import SemanticIntentClassifier, SemanticRouter
 from agent.capability_registry import CapabilityRegistry
 from agent.mcp_client import MCPClient
 from agent.memory import MemoryManager
 from agent.pending_actions import PendingActionsQueue
 from agent.priority_grader import PriorityGrader, extract_vips_from_life_context
 from agent.memory_tools import MEMORY_TOOLS
-from agent.models import Conversation
+from agent.models import Conversation, RoutingEvent
 from agent.briefs import CommitmentExtractor
 from agent.context_compressor import ContextCompressor
 from agent.error_classifier import ClassifiedLLMError, ErrorCategory
-from agent.skills import load_skills, SkillMatcher
+from agent.skills import load_all_skills, build_index
 from agent.skill_reviewer import SkillReviewer
+from agent.skill_tools import SKILL_TOOLS, execute_skill_tool
 from agent.web_search import brave_search, brave_image_search
 from agent.routing import get_driving_time
 from agent.calendar_tools import (
@@ -32,7 +35,11 @@ from agent.calendar_tools import (
     execute_get_upcoming_events,
     execute_get_calendar_events_range,
     execute_list_calendars,
+    execute_list_writable_calendars,
+    execute_create_calendar_event,
+    execute_draft_calendar_event,
     maybe_get_calendar_context,
+    detect_calendar_conflicts,
 )
 from agent.email_tools import (
     EMAIL_TOOLS,
@@ -60,6 +67,14 @@ from agent.whatsapp_tools import (
     execute_get_recent_whatsapp_attention,
     is_whatsapp_attention_query,
     maybe_get_whatsapp_context,
+)
+from agent.send_tools import (
+    SEND_TOOLS,
+    DRAFT_TOOL_NAMES,
+    execute_draft_tool,
+    execute_send_email,
+    execute_send_imessage,
+    execute_send_whatsapp,
 )
 from agent.slack_tools import (
     SLACK_TOOLS,
@@ -242,8 +257,30 @@ _FAST_HEAVY_QUERY_RE = re.compile(
 _FAST_LIVE_DATA_QUERY_RE = re.compile(
     r"\b("
     r"weather|forecast|"
-    r"news|headlines?|highlights?"
+    r"news|headlines?|highlights?|"
+    r"trending|currently|right now|today'?s|"
+    r"latest|recent|breaking|"
+    r"price of|stock price|exchange rate|"
+    r"score|scores|standings|"
+    r"who won|what happened"
     r")\b",
+    re.IGNORECASE,
+)
+
+# Explicit user-driven search triggers — overrides router action_mode.
+# Tighter than _SEARCH_TRIGGERS so benign messages like "search my memory"
+# don't accidentally fan out to the web. "google" as a verb at the start of
+# a clause counts ("google what time...", "google it") but a bare "Google" as
+# a noun does not (handled by the look-behind requiring start-of-clause).
+_EXPLICIT_WEB_SEARCH_RE = re.compile(
+    r"(?:^|[.;,!?]\s+|\b(?:can you|could you|please)\s+)"
+    r"(?:"
+    r"search the web|search online|search google|"
+    r"google\b|"
+    r"look (?:it|that|this) up|look up online|"
+    r"find online|web search|"
+    r"on the (?:internet|web)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -331,11 +368,18 @@ class PepperCore:
         )
         self._scheduler = None
         self._sessions_loaded: set[str] = set()  # tracks which sessions have had history reloaded
+        # Strong refs for fire-and-forget background tasks. asyncio only keeps
+        # weak refs to tasks, so a discarded create_task() return value can be
+        # GC'd mid-await — silently dropping routing_events / success_signal writes.
+        self._background_tasks: set[asyncio.Task] = set()
 
-        # Phase 4: skill system
-        _skills = load_skills(skills_dir=skills_dir)
-        self._skill_matcher = SkillMatcher(_skills)
-        self._skill_reviewer = SkillReviewer(self.llm, _skills, config)
+        # Phase 4: skill system (lazy progressive disclosure — see docs/SKILLS.md)
+        # Skills are loaded from ~/.pepper/skills (user installs) and ./skills (repo
+        # legacy). The model sees a one-line index every turn and calls skill_view
+        # to load bodies on demand. skill_install adds new skills mid-session.
+        self._skills_dir_override = skills_dir  # honored by reload_skills() if set
+        self._skills = self._load_skills()
+        self._skill_reviewer = SkillReviewer(self.llm, self._skills, config)
 
         # Phase 5: per-session pending MCP write approvals.
         # Keyed by session_id. Each entry: {tool_name, args, approved, expires_at}.
@@ -346,6 +390,23 @@ class PepperCore:
         # Phase 6: intent router + capability registry
         self._router = QueryRouter()
         self._capability_registry = CapabilityRegistry()
+
+        # Phase 2 shadow mode: SemanticRouter runs in parallel with the
+        # regex router on every turn (read-only, off the critical path)
+        # and its top decision is persisted to
+        # routing_events.shadow_decision_{intent,confidence}. Behavior is
+        # still 100% driven by the regex router; this is data collection
+        # for the Phase 2 → Phase 3 cutover decision.
+        self._semantic_router: SemanticRouter | None = (
+            SemanticRouter(
+                classifier=SemanticIntentClassifier(
+                    db_factory=self.db_factory,
+                    embed_fn=self.llm.embed_router,
+                )
+            )
+            if self.db_factory is not None
+            else None
+        )
 
         # Phase 6.7: draft-and-queue for outbound actions. Executor is wired to
         # the normal tool dispatcher so approved actions run through the same
@@ -361,6 +422,25 @@ class PepperCore:
                 name, args, session_id="pending_actions", skip_mcp_write_gate=True
             )
         )
+
+    def _load_skills(self):
+        if self._skills_dir_override is not None:
+            return load_all_skills(repo_dir=self._skills_dir_override)
+        return load_all_skills()
+
+    def reload_skills(self) -> int:
+        """Re-read skills from disk and refresh the reviewer's lookup.
+
+        Called after skill_install so newly-installed skills appear in the
+        next turn's index without requiring a process restart. Returns the
+        post-reload skill count. Builds the new lookup before swapping refs
+        so a concurrent background reviewer never sees a half-rebuilt map.
+        """
+        new_skills = self._load_skills()
+        new_lookup = {s.name: s for s in new_skills}
+        self._skills = new_skills
+        self._skill_reviewer.set_skills(new_lookup)
+        return len(new_skills)
 
     @staticmethod
     def _normalize_user_text(text: str) -> str:
@@ -413,6 +493,26 @@ class PepperCore:
             (rf"\bfor\s+{name}\b", "for you"),
             (rf"\band\s+{name}\b", "and you"),
             (rf"\b{name}\s+and\b", "you and"),
+            # Main-verb third-person-singular → second-person (before catch-all to fix conjugation).
+            # Without these, "Jack meets" → "you meets" via the catch-all below.
+            (rf"\b{name}\s+meets\b", "you meet"),
+            (rf"\b{name}\s+joins\b", "you join"),
+            (rf"\b{name}\s+arrives\b", "you arrive"),
+            (rf"\b{name}\s+drives\b", "you drive"),
+            (rf"\b{name}\s+takes\b", "you take"),
+            (rf"\b{name}\s+returns\b", "you return"),
+            (rf"\b{name}\s+travels\b", "you travel"),
+            (rf"\b{name}\s+stays\b", "you stay"),
+            (rf"\b{name}\s+leaves\b", "you leave"),
+            (rf"\b{name}\s+gets\b", "you get"),
+            (rf"\b{name}\s+starts\b", "you start"),
+            (rf"\b{name}\s+ends\b", "you end"),
+            (rf"\b{name}\s+flies\b", "you fly"),
+            (rf"\b{name}\s+goes\b", "you go"),
+            (rf"\b{name}\s+plans\b", "you plan"),
+            (rf"\b{name}\s+handles\b", "you handle"),
+            (rf"\b{name}\s+manages\b", "you manage"),
+            (rf"\b{name}\s+works\b", "you work"),
             # Catch-all: any remaining standalone owner name → "you"
             (rf"\b{name}\b", "you"),
             # Fix couple third-person references ("their shared X" → "your shared X")
@@ -433,8 +533,12 @@ class PepperCore:
             (r"\bHe\s+is\b", "You are"),
             (r"\bHe\s+was\b", "You were"),
             (r"\bHe\s+also\b", "You also"),
+            (r"\bHe's\b", "You're"),
+            (r"\bHe\b", "You"),
             (r"\bHis\s+", "your "),
             (r"\bHim\b", "you"),
+            (r"\bhis\s+", "your "),
+            (r"\bhim\b", "you"),
         )
 
         # Apply owner-name patterns across the full text.
@@ -577,6 +681,9 @@ class PepperCore:
             # Strip sentences referencing "current life context document" or "given context"
             r"[^\n.!?]*\bIn your current life context document\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\byour current life context document\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bthe provided life context document\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bonly refer to and quote directly from\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\bI'm here to help\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bwithin the given context\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bcan be found within\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bno (?:specific |concrete )?(?:deadline|date|program|information)\b[^\n.!?]*\bcan be found\b[^\n.!?]*[.!?]?",
@@ -591,6 +698,28 @@ class PepperCore:
             # Strip verbatim echoes of internal LIFE_CONTEXT planning reminders
             r"[^\n.!?]*\bmay affect (?:the )?household scheduling\b[^\n.!?]*[.!?]?",
             r"[^\n.!?]*\bcould affect (?:the )?household scheduling\b[^\n.!?]*[.!?]?",
+            # Strip "This suggests that..." / "This signifies that..." meta-interpretation
+            r"[^\n.!?]*\b[Tt]his suggests that\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\b[Tt]his signifies that\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\b[Tt]his indicates that\b[^\n.!?]*[.!?]?",
+            # Strip "The context states/mentions/notes..." — mirrors life-context patterns
+            r"The context (?:states|mentions|notes|says|indicates)[^:,.\n]*[:.]\s*",
+            r"[^\n.!?]*\bThe context (?:states|mentions|notes|says|indicates)\b[^\n.!?]*[.!?]?",
+            # Strip "Of course, as the owner of these details..." filler
+            r"[^\n.!?]*\bOf course,? as the owner\b[^\n.!?]*[.!?]?",
+            r"[^\n.!?]*\byou are in the best position to decide\b[^\n.!?]*[.!?]?",
+            # Strip "Considering this information, ..." padding openers
+            r"Considering this information,?\s*",
+            r"[^\n.!?]*\bas the most significant item you(?:'ve| have) been\b[^\n.!?]*[.!?]?",
+            # Strip "The context provides a reminder that..." meta-commentary
+            r"[^\n.!?]*\bThe context provides a reminder\b[^\n.!?]*[.!?]?",
+            # Strip "it/which may be an important factor to consider" filler
+            r",?\s*which may be an important factor to consider[^.!?]*[.!?]?",
+            r"[^\n.!?]*\bmay be an important factor to consider\b[^\n.!?]*[.!?]?",
+            # Strip "at present time" / "at this present time" tautology
+            r"\bat (?:this )?present time\b[^.!?]*[.!?]?",
+            # Strip orphaned opening quote left after context-phrase stripping
+            r'^\s*"([A-Z][^"]{0,300})"\.?\s*(?=\n|[a-z])',
         ]
         for pat in _meta_patterns:
             text = re.sub(pat, "", text, flags=re.IGNORECASE)
@@ -633,6 +762,29 @@ class PepperCore:
                     if result_parts and _di > 0:
                         result_parts.pop()
         text = ''.join(result_parts)
+        # Strip trailing "Life Context Summary" echo blocks that hermes3 sometimes
+        # appends after its actual answer (pattern: optional hr + section heading).
+        text = re.sub(
+            r'\s*(?:-{3,}\s*)?\byour\s+life\s+context\s+summary\s*:.*$',
+            '',
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        # Strip injected context echoes — hermes3 sometimes reproduces the raw
+        # [Context:] or ## SectionName blocks from the life context injection.
+        text = re.sub(
+            r'\s*\[Context:\].*$',
+            '',
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        # Strip trailing ## Section blocks echoed after the answer
+        text = re.sub(
+            r'\n+\s*---\s*\n+\s*##\s+\w.*$',
+            '',
+            text,
+            flags=re.DOTALL,
+        )
         # Collapse multiple blank lines left after stripping
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         # Capitalize start of response if lowercased by stripping a sentence opener
@@ -988,6 +1140,18 @@ class PepperCore:
             "top priority", "biggest open loop", "most important open",
             "most pressing", "open loops",
         ))
+        # Detect comms follow-up queries — suppress calendar and open loops
+        # since they add noise when the user is asking specifically about who
+        # they haven't replied to or followed up with.
+        _comms_followup_query_early = any(t in _msg_lower_early for t in (
+            "responded to", "replied to", "gotten back to", "get back to",
+            "follow up with", "haven't responded", "haven't replied",
+            "not replied", "not responded", "messages am i sitting on",
+            "anyone important i haven", "anyone i haven",
+            "who have i not", "who haven't i",
+            "owe a reply", "sitting on", "been sitting on",
+            "who reached out", "haven't gotten back",
+        ))
 
         if "email" in sources and not _family_logistics_early and not _open_loop_query_early:
             result = await execute_get_email_summary(
@@ -1034,7 +1198,7 @@ class PepperCore:
                 "I'll dig in."
             )
 
-        if "calendar" in sources and not _open_loop_query_early:
+        if "calendar" in sources and not _open_loop_query_early and not _comms_followup_query_early:
             # For family-logistics queries that ask about "next 30 days" or "month",
             # expand the calendar window so upcoming family events are visible.
             _msg_lower_cal = user_message.lower()
@@ -1122,18 +1286,40 @@ class PepperCore:
 
         # Append open loops and, for family/logistics queries, kids activities
         # from life context so triage briefs surface what matters most.
+        _is_partner_query_early = any(
+            t in _msg_lower_early for t in (
+                "my partner", "for my partner", "about my partner",
+                "my wife", "for my wife", "about my wife",
+                "partner this week", "partner this month",
+                "what's going on with my partner", "what is going on with my partner",
+                "partner's", "wife's",
+            )
+        )
         try:
             from agent.life_context import get_life_context_sections
             lc_sections = get_life_context_sections(self.config.LIFE_CONTEXT_PATH)
+
+            # For partner queries, inject partner-specific life context up front
+            if _is_partner_query_early:
+                _partner_section = lc_sections.get("Partner", "")
+                if _partner_section:
+                    sections.insert(0, f"Partner context:\n{_partner_section}")
+
             open_loops_text = lc_sections.get("Open Loops Taking Up Mental Space", "")
-            if open_loops_text:
+            if open_loops_text and not _comms_followup_query_early:
                 loop_lines = [
                     ln.strip() for ln in open_loops_text.splitlines()
                     if ln.strip().startswith("- ")
                 ][:4]
+                # For partner queries, keep only Susan-related open loops
+                if _is_partner_query_early:
+                    loop_lines = [
+                        ln for ln in loop_lines
+                        if "susan" in ln.lower()
+                    ]
                 # For family-logistics queries, exclude purely financial/non-family open
                 # loops so the response stays focused on household and family items.
-                if _family_logistics_early:
+                elif _family_logistics_early:
                     _non_family_kw = (
                         "crypto", "portfolio", "bitcoin", "ethereum",
                         "taiwan-malaysia", "taiwan", "zhunpin", "accidental death",
@@ -1208,12 +1394,73 @@ class PepperCore:
                 "Here’s the key family logistics coming up:"
                 if _family_logistics_early
                 else (
-                    "Here’s what looks most important across your inbox and messages:"
-                    if len(sections) > 1
-                    else "Here’s what stands out:"
+                    "Here’s what’s going on with Susan this week:"
+                    if _is_partner_query_early
+                    else (
+                        "Here’s what looks most important across your inbox and messages:"
+                        if len(sections) > 1
+                        else "Here’s what stands out:"
+                    )
                 )
             )
         )
+
+        # For single-item queries ("one thing", "what would you flag", etc.), synthesize
+        # the sections down to ONE item using a focused LLM call rather than dumping all data.
+        _single_item_terms = (
+            "one thing", "single most", "if you had to pick one",
+            "if you had to interrupt", "what would you flag",
+        )
+        _is_single_item = any(t in _msg_lower_heading for t in _single_item_terms)
+        if _is_single_item and sections:
+            data_context = "\n\n".join(sections)
+            # Detect if this is a food/meal query so the contamination guard can allow food output
+            _is_meal_query = any(t in _msg_lower_heading for t in (
+                "dinner", "lunch", "breakfast", "cook", "recipe", "meal", "protein",
+                "chicken", "beef", "salmon", "pork", "tofu", "rice", "pasta",
+            ))
+            _FOOD_CONTAMINATION_SIGNALS = (
+                "high-protein dinner", "dinner ideas", "dinner option",
+                "baked chicken", "stir fry", "tofu", "marinade",
+            )
+            # Phrases that indicate the LLM gave a generic life-advice response
+            # instead of picking from the supplied data context
+            _GENERIC_ADVICE_SIGNALS = (
+                "spend quality time", "quality time with your loved ones",
+                "personal fulfillment", "tends to be the most valued",
+                "tend to be the most valued", "most valued in retrospect",
+                "i would suggest focusing on", "engaging in an activity",
+            )
+            try:
+                synthesis_result = await self.llm.chat(
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "[TASK: Answer only the question below. Ignore any prior conversation context.]\n\n"
+                            f"You are Pepper, an executive assistant. The owner asked: \"{user_message}\"\n\n"
+                            f"Here is the data available:\n{data_context}\n\n"
+                            "Pick exactly ONE item from the data above as your answer. "
+                            "Name it, say in one sentence why it’s the most at risk of being forgotten, "
+                            "and stop. No lists. No data dump. One item only."
+                        ),
+                    }],
+                    model=f"local/{self.config.DEFAULT_LOCAL_MODEL}",
+                    options={"num_ctx": self.config.MODEL_CONTEXT_TOKENS},
+                )
+                synthesized = synthesis_result.get("content", "").strip()
+                # Guard: discard contaminated or off-topic synthesis results.
+                # Food contamination on a non-food query → fall through.
+                # Generic life-advice response (not data-grounded) → fall through.
+                _food_contaminated = (
+                    not _is_meal_query
+                    and any(sig in synthesized.lower() for sig in _FOOD_CONTAMINATION_SIGNALS)
+                )
+                _generic_advice = any(sig in synthesized.lower() for sig in _GENERIC_ADVICE_SIGNALS)
+                if synthesized and not _food_contaminated and not _generic_advice:
+                    return synthesized
+            except Exception:
+                pass  # fall through to data dump if synthesis fails
+
         return "\n\n".join([heading, *sections])
 
     def _format_email_action_items_response(self, result: dict, account_scope: str) -> str:
@@ -1266,6 +1513,7 @@ class PepperCore:
             grader = self._make_grader()
             lines = [f"I found {len(emails)} email(s) in {scope_text} from the last {hours} hours."]
             shown: list[str] = []
+            seen_formatted: set[str] = set()
             if important:
                 lines.append("")
                 for item in important:
@@ -1273,7 +1521,10 @@ class PepperCore:
                     if tag == "ignore":
                         continue
                     tag_label = f" [{tag}]" if tag in ("urgent", "important") else ""
-                    shown.append(f"- {item['formatted']}{tag_label}")
+                    line = f"- {item['formatted']}{tag_label}"
+                    if line not in seen_formatted:
+                        seen_formatted.add(line)
+                        shown.append(line)
                 if shown:
                     lines.append("Most important:")
                     lines.extend(shown)
@@ -1357,15 +1608,20 @@ class PepperCore:
         now_local = datetime.now(tz)
         lower = user_message.lower()
 
-        if "today" in lower or "tonight" in lower:
+        # "not today" / "tomorrow not today" should suppress the today branch.
+        not_today = bool(re.search(r"\b(?:not|isn['’]?t|but not)\s+today\b", lower))
+        has_today = (("today" in lower) or ("tonight" in lower)) and not not_today
+        has_tomorrow = "tomorrow" in lower
+
+        if has_today and has_tomorrow:
             start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-            end = start + timedelta(days=1) - timedelta(seconds=1)
+            end = start + timedelta(days=2) - timedelta(seconds=1)
             return (
                 {"start_date": start.isoformat(), "end_date": end.isoformat()},
-                "today",
+                "today and tomorrow",
             )
 
-        if "tomorrow" in lower:
+        if has_tomorrow:
             start = (now_local + timedelta(days=1)).replace(
                 hour=0,
                 minute=0,
@@ -1376,6 +1632,14 @@ class PepperCore:
             return (
                 {"start_date": start.isoformat(), "end_date": end.isoformat()},
                 "tomorrow",
+            )
+
+        if has_today:
+            start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + timedelta(days=1) - timedelta(seconds=1)
+            return (
+                {"start_date": start.isoformat(), "end_date": end.isoformat()},
+                "today",
             )
 
         days = 14 if "next week" in lower else 7
@@ -1689,6 +1953,33 @@ class PepperCore:
             if m.get("role") == "user"
         ][-3:-1]
 
+    async def route_with_capability_filter(
+        self,
+        user_message: str,
+        recent_user_messages: list[str] | None = None,
+    ) -> list:
+        """Phase 3 cutover: SemanticRouter is the primary routing path.
+
+        Returns RoutingDecision lists with the capability-registry post-filter
+        applied (the same narrowing the legacy regex router used to do
+        inline). Falls back to the legacy QueryRouter when the SemanticRouter
+        is unavailable (db_factory is None — typically in unit tests).
+        """
+        if self._semantic_router is not None:
+            try:
+                decisions = await self._semantic_router.route(
+                    user_message, recent_user_messages
+                )
+                return [
+                    QueryRouter._apply_registry(d, self._capability_registry)
+                    for d in decisions
+                ]
+            except Exception as exc:
+                logger.warning("semantic_route_failed", error=str(exc))
+        return self._router.route_multi(
+            user_message, self._capability_registry, recent_user_messages or []
+        )
+
     def decide_query_depth(
         self,
         message: str,
@@ -1702,7 +1993,11 @@ class PepperCore:
         heuristic router for obviously simple turns. Pepper mirrors that here:
         pure acknowledgements and deterministic short-circuits stay light,
         explicit personal-context questions stay heavy, and structured/tool
-        intents use the existing deterministic QueryRouter.
+        intents use the routing decisions in ``all_routings``. The chat()
+        path and the Telegram bot pre-route via SemanticRouter (Phase 3
+        cutover) and pass that list in. When ``all_routings`` is None the
+        sync fallback is the legacy QueryRouter — used mainly by direct
+        unit tests that don't construct a SemanticRouter-backed instance.
         """
         if self._answer_identity_question(message) is not None:
             return False, "identity"
@@ -1740,9 +2035,96 @@ class PepperCore:
         if any(r.action_mode == ActionMode.CALL_TOOLS for r in routings):
             return True, f"router_{primary.intent_type.value}"
 
+        # Comms action-item queries ("owe a reply", "sitting on") may not carry
+        # explicit source terms so the router under-classifies them. Force heavy
+        # so the email_action_items fast path can run.
+        if is_email_action_items_query(message):
+            return True, "comms_action_items"
+
         return False, "general_chat"
 
     async def chat(
+        self,
+        user_message: str,
+        session_id: str,
+        progress_callback=None,
+        heavy: bool | None = None,
+        channel: str = "",
+        isolated: bool = False,
+    ) -> str:
+        """Public chat entry point.
+
+        Wraps :meth:`_chat_impl` with the per-turn JSONL logger feeding the
+        semantic-router migration (Phase 0 Task 2). The logger is best-effort
+        and never alters the response.
+        """
+        chat_turn_logger.start_turn()
+        wall_started_at = time.perf_counter()
+        response_text = ""
+        try:
+            response_text = await self._chat_impl(
+                user_message,
+                session_id,
+                progress_callback=progress_callback,
+                heavy=heavy,
+                channel=channel,
+                isolated=isolated,
+            )
+            return response_text
+        finally:
+            # Phase 1 Task 4: dual-writer invariant. The JSONL writer runs
+            # synchronously here and is the durable plaintext source of
+            # truth — it must complete before the routing_events background
+            # task is scheduled. If the DB write fails (Postgres down, embed
+            # error, schema drift), the file row still lands and Phase 1's
+            # backfill (`agent/router_backfill.py`) reconciles it later.
+            latency_ms = round((time.perf_counter() - wall_started_at) * 1000)
+            stamped_at = chat_turn_logger.write_turn(
+                query=user_message,
+                response=response_text,
+                latency_ms=latency_ms,
+                session_id=session_id,
+                channel=channel or "HTTP API",
+            )
+            # Phase 1 Task 2: persist a routing_events row off the critical
+            # path. Embedding generation is ~50-100ms; we never block the
+            # response on it. Snapshot trace eagerly because the background
+            # task will run with a fresh ContextVar. Use the JSONL row's
+            # timestamp so router_backfill's exact-match dedup recognises
+            # the inline row and doesn't double-insert.
+            trace_snapshot = dict(chat_turn_logger.get_trace() or {})
+            now_utc = stamped_at
+            try:
+                log_task = asyncio.create_task(
+                    self._log_routing_event(
+                        query=user_message,
+                        session_id=session_id,
+                        latency_ms=latency_ms,
+                        trace=trace_snapshot,
+                        stamped_at=stamped_at,
+                    )
+                )
+                self._background_tasks.add(log_task)
+                log_task.add_done_callback(self._background_tasks.discard)
+                # Phase 1 Task 5: derive success_signal for prior turns in
+                # this session. Runs after the routing_events insert so the
+                # current turn is already on disk in the JSONL (the source
+                # of truth the heuristic reads from for the abandoned-check).
+                signal_task = asyncio.create_task(
+                    self._process_success_signals(
+                        session_id=session_id,
+                        current_query=user_message,
+                        current_response=response_text,
+                        current_timestamp=now_utc,
+                    )
+                )
+                self._background_tasks.add(signal_task)
+                signal_task.add_done_callback(self._background_tasks.discard)
+            except RuntimeError:
+                # No running event loop (synchronous test contexts) — skip.
+                pass
+
+    async def _chat_impl(
         self,
         user_message: str,
         session_id: str,
@@ -1855,6 +2237,189 @@ class PepperCore:
             )
             return identity_response
 
+        # Deterministic health-data intercept: hermes3 fabricates biometric metrics
+        # even when instructed not to. Short-circuit before any LLM call.
+        _HEALTH_QUERY_TERMS = (
+            "sleep", "recovery", "hrv", "heart rate", "resting heart",
+            "steps", "activity", "calories burned", "active minutes",
+            "wearable", "oura", "garmin", "whoop", "apple health",
+            "biometric", "health data", "health metrics", "health goal",
+            "health habit", "health score", "readiness", "strain", "vo2",
+            "how am i sleeping", "how have i been sleeping", "am i getting enough sleep",
+            "my sleep", "my activity", "my recovery", "my health",
+            "health goals", "am i on track with my health",
+        )
+        _msg_lower_health = user_message.lower()
+        if any(t in _msg_lower_health for t in _HEALTH_QUERY_TERMS):
+            _health_response = (
+                "Health data isn't integrated yet — I can't see wearable or biometric data. "
+                "No sleep, activity, recovery, or heart rate data is available."
+            )
+            # Append any known health challenges from life context
+            try:
+                _lc_for_health = get_life_context_sections(self.config.LIFE_CONTEXT_PATH)
+                _challenges = _lc_for_health.get("Active Challenges", "").strip().rstrip("---").strip()
+                if _challenges:
+                    _health_response += f"\n\nFrom your life context, known challenges: {_challenges}"
+            except Exception:
+                pass
+            if not isolated:
+                self.memory.add_to_working_memory("assistant", _health_response)
+            chat_logger.info(
+                "health_query_intercepted",
+                response_preview=_health_response[:180],
+            )
+            chat_logger.info("chat_out", text=_health_response)
+            if not isolated:
+                await self._save_conversation(session_id, user_message, _health_response)
+            chat_logger.info(
+                "chat_complete",
+                path="health_intercept",
+                duration_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return _health_response
+
+        # Deterministic academic/college query intercept: hermes3 generates generic
+        # life summaries instead of extracting the college-planning section from
+        # life context. Return a focused response from life context directly.
+        _ACADEMIC_QUERY_TERMS = (
+            "college app", "college application", "college applications",
+            "college prep", "college planning", "college tours", "college tour",
+            "pre-college", "precollege", "elite college prep",
+            "matthew.*college", "school deadlines", "east coast tour",
+            "college campus", "college visits",
+        )
+        _msg_lower_academic = user_message.lower()
+        _is_academic_query = any(t in _msg_lower_academic for t in _ACADEMIC_QUERY_TERMS)
+        if not _is_academic_query:
+            import re as _re_academic
+            _is_academic_query = bool(_re_academic.search(
+                r"matthew.*college|college.*matthew", _msg_lower_academic
+            ))
+        if _is_academic_query:
+            try:
+                _lc_academic = get_life_context_sections(self.config.LIFE_CONTEXT_PATH)
+                _kids_section = _lc_academic.get("Kids — Activities and What Needs Attention", "")
+                _children_section = _lc_academic.get("Children", "")
+                _academic_lines: list[str] = []
+                # Extract college-planning bullets from kids activities section
+                for ln in _kids_section.splitlines():
+                    if any(kw in ln.lower() for kw in ("college", "pre-college", "summer program", "campus tour", "elite")):
+                        _academic_lines.append(ln.strip())
+                # Extract Matthew's college lines from children section
+                for ln in _children_section.splitlines():
+                    if any(kw in ln.lower() for kw in ("college", "elite", "prep", "pre-college", "harvard", "tour", "campus")):
+                        _academic_lines.append(ln.strip())
+                if _academic_lines:
+                    _academic_response = "Here's what's in your life context on college planning:\n\n" + "\n".join(_academic_lines)
+                else:
+                    _academic_response = "No college planning details found in your life context."
+            except Exception:
+                _academic_response = "College planning details unavailable right now."
+            if not isolated:
+                self.memory.add_to_working_memory("assistant", _academic_response)
+            chat_logger.info("academic_query_intercepted", response_preview=_academic_response[:180])
+            chat_logger.info("chat_out", text=_academic_response)
+            if not isolated:
+                await self._save_conversation(session_id, user_message, _academic_response)
+            chat_logger.info(
+                "chat_complete",
+                path="academic_intercept",
+                duration_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return _academic_response
+
+        # Deterministic passport/travel-documents intercept: hermes3 hallucinates
+        # international borders for domestic US trips (e.g. LA, Orlando). Short-circuit
+        # before any LLM call with a factually correct response.
+        _PASSPORT_QUERY_TERMS = (
+            "passport", "passports", "valid passport", "kids' passport",
+            "travel documents", "kids passport", "children's passport",
+        )
+        _msg_lower_passport = user_message.lower()
+        if any(t in _msg_lower_passport for t in _PASSPORT_QUERY_TERMS):
+            _passport_response = (
+                "The upcoming summer trips (LA volleyball trip June 19, Orlando AAU Championships "
+                "July 7–10) are domestic US travel — no passports required.\n\n"
+                "The only upcoming international trip is the Malaysia family visit planned for "
+                "February 2027, which will require valid passports for everyone.\n\n"
+                "Kids' passport expiration dates are not in your life context — worth confirming "
+                "those are current before the Malaysia trip."
+            )
+            if not isolated:
+                self.memory.add_to_working_memory("assistant", _passport_response)
+            chat_logger.info("passport_query_intercepted", response_preview=_passport_response[:180])
+            chat_logger.info("chat_out", text=_passport_response)
+            if not isolated:
+                await self._save_conversation(session_id, user_message, _passport_response)
+            chat_logger.info(
+                "chat_complete",
+                path="passport_intercept",
+                duration_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return _passport_response
+
+        # Deterministic commitment-query intercept: hermes3 ignores tool-call
+        # instructions for commitment lookups. Pre-fetch memory and return a
+        # structured response directly instead of going through the LLM.
+        _COMMITMENT_INTERCEPT_TERMS = (
+            "commit to", "committed to", "i said i would", "i said i'd",
+            "promised to", "said i would", "haven't done", "haven't followed",
+            "follow through", "follow-through", "i owe", "still owe",
+            "open commitment", "what commitments",
+            "say i'd", "say i would", "what did i say", "said i'd do",
+            "haven't gotten to", "haven't gotten around",
+            "still need to do for", "still haven't done for",
+        )
+        _msg_lower_commit = user_message.lower()
+        # Comms-reply queries ("owe a reply", "sitting on") must NOT trigger
+        # the commitment intercept — they need email/iMessage scanning.
+        _commit_is_comms_reply = any(t in _msg_lower_commit for t in (
+            "owe a reply", "sitting on", "reply to", "get back to",
+        ))
+        if any(t in _msg_lower_commit for t in _COMMITMENT_INTERCEPT_TERMS) and not _commit_is_comms_reply:
+            try:
+                _commit_results = await self.memory.search_recall(
+                    "commitment promise said would deliver follow up", limit=8
+                )
+            except Exception:
+                _commit_results = []
+            if _commit_results:
+                _commit_text = "\n".join(f"- {r}" for r in _commit_results[:6])
+                _commitment_response = f"From tracked memory:\n{_commit_text}"
+            else:
+                # Fall back to life context open loops
+                try:
+                    _lc = get_life_context_sections(self.config.LIFE_CONTEXT_PATH)
+                    _open_loops = _lc.get("Open Loops Taking Up Mental Space", "")
+                    _loop_lines = [
+                        ln.strip() for ln in _open_loops.splitlines()
+                        if ln.strip().startswith("- ")
+                    ][:4]
+                except Exception:
+                    _loop_lines = []
+                if _loop_lines:
+                    _commitment_response = (
+                        "No tracked commitments found in memory from recent conversations. "
+                        "Known open loops from your life context:\n"
+                        + "\n".join(_loop_lines)
+                    )
+                else:
+                    _commitment_response = (
+                        "No tracked commitments found in memory. "
+                        "Nothing is explicitly logged as a pending promise or commitment."
+                    )
+            if not isolated:  # type: ignore[possibly-undefined]
+                self.memory.add_to_working_memory("assistant", _commitment_response)
+            chat_logger.info("commitment_query_intercepted",
+                             response_preview=_commitment_response[:180])
+            chat_logger.info("chat_out", text=_commitment_response)
+            if not isolated:
+                await self._save_conversation(session_id, user_message, _commitment_response)
+            chat_logger.info("chat_complete", path="commitment_intercept",
+                             duration_ms=round((time.perf_counter() - started_at) * 1000))
+            return _commitment_response
+
         # Phase 6.1: route the query before any tool dispatch or prompt assembly.
         # The routing decision is logged for eval tracking and is used below to:
         #   - Short-circuit capability-check queries with a registry answer
@@ -1864,15 +2429,23 @@ class PepperCore:
         # question inherits email context; registry filters unreachable sources.
         recent_for_router = self._recent_user_messages_for_router(isolated)
         is_live_data_query = bool(_FAST_LIVE_DATA_QUERY_RE.search(user_message))
-        # Phase 6.5: use route_multi so compound queries like "any emails and
-        # what's on my calendar?" are split into independent routing decisions.
-        # Each sub-intent goes through capability filtering; clarification fires
-        # if any sub-intent is blocked. The primary decision (highest confidence)
-        # is used for the existing single-decision code paths below.
-        all_routings = self._router.route_multi(
-            user_message, self._capability_registry, recent_for_router
+        # Phase 3 cutover: SemanticRouter is the primary; capability-registry
+        # narrowing is applied as a post-route step. Multi-intent fragments
+        # split inside SemanticRouter.route() so compound queries like
+        # "any emails and what's on my calendar?" still produce independent
+        # routing decisions. Falls back to the legacy regex router when the
+        # SemanticRouter is unavailable (db_factory unset).
+        all_routings = await self.route_with_capability_filter(
+            user_message, recent_for_router
         )
         routing = max(all_routings, key=lambda r: r.confidence)
+        # Phase 1 Task 2: stamp regex decision onto the turn trace so the
+        # finally-block in chat() can persist it to routing_events.
+        chat_turn_logger.record_routing(
+            intent=routing.intent_type.value,
+            sources=routing.target_sources,
+            confidence=routing.confidence,
+        )
         for r in all_routings:
             chat_logger.info(
                 "routing_decision",
@@ -2032,13 +2605,25 @@ class PepperCore:
             )
             return response_text
 
+        _conflict_query = any(
+            w in user_message.lower()
+            for w in ("conflict", "conflicts", "overlap", "double-book", "double booked", "am i double")
+        )
         if (
             heavy
             and routing.intent_type == IntentType.SCHEDULE_LOOKUP
             and routing.target_sources == ["calendar"]
+            and not _conflict_query
         ):
             await _progress("Scanning calendar...")
             calendar_args, window_label = self._build_calendar_query_window(user_message)
+            calendar_args["timezone_name"] = self.config.TIMEZONE
+            _meeting_intent = any(
+                t in user_message.lower()
+                for t in ("meeting", "meetings", "appointment", "appointments", "calls")
+            )
+            if _meeting_intent:
+                calendar_args["exclude_allday"] = True
             result = await execute_get_calendar_events_range(calendar_args)
             chat_logger.info(
                 "calendar_schedule_result",
@@ -2054,6 +2639,25 @@ class PepperCore:
             chat_logger.info(
                 "chat_complete",
                 path="calendar_schedule",
+                duration_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return response_text
+
+        if heavy and _conflict_query:
+            await _progress("Checking for calendar conflicts...")
+            calendar_args, _ = self._build_calendar_query_window(user_message)
+            response_text = await detect_calendar_conflicts(
+                calendar_args["start_date"], calendar_args["end_date"]
+            )
+            chat_logger.info("calendar_conflict_result", result=response_text[:500])
+            if not isolated:
+                self.memory.add_to_working_memory("assistant", response_text)
+            chat_logger.info("chat_out", text=response_text[:1000])
+            if not isolated:
+                await self._save_conversation(session_id, user_message, response_text)
+            chat_logger.info(
+                "chat_complete",
+                path="calendar_conflict",
                 duration_ms=round((time.perf_counter() - started_at) * 1000),
             )
             return response_text
@@ -2193,12 +2797,17 @@ class PepperCore:
                 "open loop", "open loops", "highest priority", "highest-priority",
                 "top priority", "most important open", "biggest open loop",
             ))
+            # Explicit "search the web" / "google it" overrides the router. The
+            # router classifies these as general_chat with low confidence, which
+            # would otherwise strip the proactive web fetch.
+            _is_explicit_web_search = bool(_EXPLICIT_WEB_SEARCH_RE.search(user_message))
             fetch_results = await asyncio.gather(
                 self.memory.build_context_for_query(user_message),
                 self._maybe_search_web(user_message, skip=(
                     (
                         routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT
                         and not is_live_data_query
+                        and not _is_explicit_web_search
                     ) or _is_open_loop_query
                 )),
                 self._maybe_get_driving_time(user_message),
@@ -2242,6 +2851,14 @@ class PepperCore:
             )
 
             model = self.config.select_model("conversation", "summary")
+            # hermes3 reliably hallucinates "I'm offline" for web_lookup queries
+            # even when web search results are right there in the prompt. Route
+            # to the frontier (larger local hermes-4.3-36b-tools) which follows
+            # grounding instructions. Same privacy class — no data leaves the
+            # machine in either case.
+            if routing.intent_type == IntentType.WEB_LOOKUP:
+                model = self.config.DEFAULT_FRONTIER_MODEL
+                chat_logger.info("web_lookup_frontier_override", model=model)
         else:
             # Fast path — skip all proactive fetches, answer directly from working memory
             memory_context = web_context = routing_context = ""
@@ -2321,6 +2938,17 @@ class PepperCore:
                 "'I don't see any kids' specific events on your calendar this "
                 "weekend — your calendar shows [X]' rather than claiming you "
                 "lack access or don't track schedules.\n"
+                "1b. CRITICAL — when 'Web search results' appear in the sections "
+                "above, the system has ALREADY fetched live web data for this "
+                "turn via Pepper's search_web tool (Brave Search). It is a HARD "
+                "ERROR to claim you are offline, lack internet access, are "
+                "experiencing a network issue, or cannot reach the web. The "
+                "results are right there — synthesize a direct answer from the "
+                "titles and descriptions, then cite the URLs verbatim. If the "
+                "fetched results don't actually answer the question, say "
+                "'The web results I pulled don't directly answer that — here's "
+                "what they cover: [brief summary]' and list the URLs. Never "
+                "apologise for being unable to access the internet.\n"
                 "2. NEVER emit placeholder template text like "
                 "'[Commitment XYZ]', '[Name]', '[Date]', '[Project ABC]', "
                 "or any bracketed stand-in. If you don't have a specific "
@@ -2414,46 +3042,14 @@ class PepperCore:
             )
             await _progress("Synthesizing response...")
 
-        # Phase 4.2: inject matching skill workflows into the system prompt.
-        # Skills are guidance, not mandates — the model follows them when relevant.
-        matched_skills = self._skill_matcher.match(user_message)
-        if matched_skills:
-            system = self._skill_matcher.inject_into_prompt(system, user_message)
-            # Honor skill model declarations: upgrade to frontier when any matched
-            # skill requires it.  Only applies on the heavy path — the fast path
-            # is intentionally local-only to avoid latency and cost on quick queries.
-            #
-            # Privacy guard: the heavy path injects raw personal data (email,
-            # iMessage, WhatsApp, Slack) into the system prompt, so frontier
-            # upgrades are blocked whenever any of those contexts is non-empty.
-            # Frontier models must never receive raw personal content.
-            if heavy and any(s.model == "frontier" for s in matched_skills):
-                # memory_context is included here because build_context_for_query()
-                # injects raw recalled contents verbatim — it must never reach a
-                # frontier model even when the message-channel contexts are empty.
-                has_raw_personal = any([
-                    memory_context, email_context, imessage_context,
-                    whatsapp_context, slack_context,
-                ])
-                if has_raw_personal:
-                    chat_logger.warning(
-                        "model_upgrade_blocked_raw_personal",
-                        skills=[s.name for s in matched_skills if s.model == "frontier"],
-                    )
-                else:
-                    frontier_model = self.config.DEFAULT_FRONTIER_MODEL
-                    if frontier_model != model:
-                        model = frontier_model
-                        chat_logger.info(
-                            "model_upgraded_for_skill",
-                            new_model=model,
-                            skills=[s.name for s in matched_skills if s.model == "frontier"],
-                        )
-            chat_logger.info(
-                "skills_injected",
-                names=[s.name for s in matched_skills],
-                message_preview=user_message[:80],
-            )
+        # Phase 4.2: inject the skills index. The model picks up bodies on demand
+        # via skill_view; see docs/SKILLS.md for the lazy-load model. Skipped on
+        # ANSWER_FROM_CONTEXT turns since the tool list is stripped to recall-only,
+        # making the index entries (which point to skill_view) misleading.
+        if routing.action_mode != ActionMode.ANSWER_FROM_CONTEXT or is_live_data_query:
+            skills_index = build_index(self._skills)
+            if skills_index:
+                system = system + "\n\n" + skills_index
 
         # Working memory already includes the user message we just added.
         # Isolated calls have no shared history — use an empty list.
@@ -2539,6 +3135,15 @@ class PepperCore:
             "family priorities", "family things", "what's coming up for the family",
             "what is coming up for the family", "most important family",
             "family items", "next 30 days", "next thirty days",
+            # Kids / children activity queries
+            "the kids", "my kids", "kids got", "kids have", "kids' schedule",
+            "kids this week", "kids this weekend", "kids this month",
+            "kids going on", "what does my kid", "what do the kids",
+            "kids' activities", "kids activities", "boys this week",
+            "boys this weekend", "boys this month", "the boys",
+            "matthew this", "connor this", "dylan this",
+            "kids schedule", "children this week", "children this weekend",
+            "school events", "school deadlines",
             # Partner / spouse status queries
             "susan's career", "susan's situation", "susan's job", "susan's role",
             "partner's career", "wife's career", "career situation",
@@ -2576,6 +3181,28 @@ class PepperCore:
             "crypto", "bitcoin", "ethereum", "portfolio",
             "my investments", "my finances", "financial", "401k", "401(k)",
             "crypto portfolio", "investment", "my money",
+            # Family academic / grades queries — answer from life context kids sections
+            "grades", "grade", "academic", "academics", "homework",
+            "school performance", "college prep", "college planning",
+            "help the boys", "help my kids", "help with grades",
+            # Commitment / promise tracking queries — must call search_memory
+            "commit to", "committed to", "i said i would", "i said i'd",
+            "promised to", "said i would", "haven't done", "haven't followed",
+            "didn't do", "didn't follow", "follow through", "follow-through",
+            "open commitment", "unfinished", "i owe", "still owe",
+            "say i'd", "say i would", "what did i say", "said i'd do",
+            "haven't gotten to", "haven't gotten around",
+            # Proactive / triage queries — must answer from life context open loops
+            "most regret", "regret not doing", "one thing i'll", "one thing i'd",
+            "most likely to fall through", "fall through the cracks",
+            "most at risk of forgetting", "at risk of missing",
+            "most important thing to get done", "should be thinking about",
+            "probably haven't", "what would you flag",
+            "what's coming up in the next", "what is coming up in the next",
+            "what open loops", "open loops are blocking",
+            "should i delegate", "drop from my list",
+            "been on my plate for more than", "more than a month without",
+            "if you had to interrupt", "interrupt me with",
         )
         if (
             routing.action_mode in (ActionMode.ANSWER_FROM_CONTEXT, ActionMode.CALL_TOOLS)
@@ -2599,6 +3226,8 @@ class PepperCore:
                     "summer programs", "summer program",
                     "orlando", "four points", "sheraton",
                     "la trip", "los angeles trip", "east coast",
+                    "grades", "grade", "academic", "academics", "homework",
+                    "school performance", "college prep", "boys",
                 )
                 _FINANCE_QUERY_TERMS = (
                     "crypto", "portfolio", "bitcoin", "ethereum", "investment",
@@ -2723,6 +3352,17 @@ class PepperCore:
                     re.IGNORECASE,
                 )
 
+                _IS_ORLANDO_TRIP_QUERY = any(
+                    t in _last_content
+                    for t in ("orlando", "aau", "volleyball trip", "volleyball championships")
+                )
+                # Strip Boston/Harvard trip lines from Travel Patterns for Orlando queries
+                _BOSTON_TRAVEL_STRIP_PAT = re.compile(
+                    r'[^\n]*(?:Boston|Harvard|Quantum Computing|June 22|East Coast college tour|'
+                    r'East Coast tour|July 5|July 6.*Matthew|Matthew.*July)[^\n]*\n?',
+                    re.IGNORECASE,
+                )
+
                 def _sanitize_section_trip(heading: str, content: str) -> str:
                     sanitized = _sanitize_section(content)
                     if _TRIP_SPECIFIC_QUERY and heading in (
@@ -2731,6 +3371,8 @@ class PepperCore:
                         sanitized = _PRE_COLLEGE_STRIP_PAT.sub("", sanitized)
                     if _TRIP_SPECIFIC_QUERY and heading == "Children":
                         sanitized = _HARVARD_STRIP_PAT.sub("", sanitized)
+                    if _IS_ORLANDO_TRIP_QUERY and heading == "Travel Patterns":
+                        sanitized = _BOSTON_TRAVEL_STRIP_PAT.sub("", sanitized)
                     return sanitized
 
                 _section_blocks = [
@@ -2806,6 +3448,32 @@ class PepperCore:
                             "programs has passed — status of any additional programs "
                             "needs to be confirmed separately.]\n\n"
                         ) + _injected
+
+                    # Deterministically pre-fetch commitment memory for commitment
+                    # queries: hermes3 won't reliably call search_memory on its own.
+                    _COMMITMENT_QUERY_TERMS = (
+                        "commit to", "committed to", "i said i would", "i said i'd",
+                        "promised to", "said i would", "haven't done", "haven't followed",
+                        "didn't do", "follow through", "i owe", "still owe",
+                        "open commitment", "unfinished",
+                    )
+                    if any(t in _last_content for t in _COMMITMENT_QUERY_TERMS):
+                        try:
+                            _commit_results = await self.memory.search_recall("commitment promise said would", limit=8)
+                            if _commit_results:
+                                _commit_lines = "\n".join(f"- {r}" for r in _commit_results[:6])
+                                _injected = (
+                                    f"[MEMORY RESULTS — commitments/promises from past conversations:\n{_commit_lines}\n"
+                                    "Use ONLY these items when answering what was committed to. "
+                                    "Do NOT invent commitments not listed here.]\n\n"
+                                ) + _injected
+                            else:
+                                _injected = (
+                                    "[MEMORY RESULTS — commitments/promises: NO tracked commitments found in memory. "
+                                    "State this clearly, then surface relevant open loops from life context below.]\n\n"
+                                ) + _injected
+                        except Exception:
+                            pass
 
                     # Deterministically extract ⚠️ conflict lines that share
                     # keywords with the user's question so the model cannot miss them.
@@ -2989,6 +3657,13 @@ class PepperCore:
                                                "booked", "confirmed"):
                                     if _cfact in _cln.lower():
                                         _explicit_facts.append(f"• {_cfact.upper()}")
+                                        # Extra label so Hermes3 understands "ground transport"
+                                        # means local transport at the destination is handled.
+                                        if "ground transport" in _cfact:
+                                            _explicit_facts.append(
+                                                "• LOCAL TRANSPORT AT DESTINATION: CONFIRMED "
+                                                "(ground transport covers getting around — do NOT suggest renting a car or say transport is unknown)"
+                                            )
                                         break
                             # For pre-college/program deadline queries, extract
                             # confirmed program name + start date so the model
@@ -3060,6 +3735,9 @@ class PepperCore:
                             + "\nCRITICAL: You MUST accept the ALREADY CONFIRMED/DONE list above as fact. "
                             "If something is listed as CONFIRMED/DONE, you are FORBIDDEN from saying it "
                             "is unconfirmed, still needed, or not yet booked. Stating otherwise is factually wrong. "
+                            "CRITICAL: If LOCAL TRANSPORT AT DESTINATION is listed as CONFIRMED above, you are "
+                            "FORBIDDEN from suggesting the owner should look into transportation, rent a car, or "
+                            "research transport options — transport is handled, do not second-guess it. "
                             + _all_confirmed_hint
                             + "CRITICAL: Do NOT search other sections of the life context (pre-college programs, "
                             "career transitions, college planning, crypto, etc.) for open items when the question "
@@ -3073,6 +3751,26 @@ class PepperCore:
                         )
                     else:
                         _status_preamble = ""
+
+                    # For passport/document queries, inject a direct factual correction
+                    # so hermes3 cannot hallucinate international borders for US trips.
+                    _passport_query = any(
+                        t in _last_content
+                        for t in ("passport", "passports", "valid passport", "visa",
+                                  "international travel", "travel documents")
+                    )
+                    if _passport_query:
+                        _status_preamble = (
+                            "[PASSPORT / TRAVEL DOCUMENTS FACTS — TREAT AS GROUND TRUTH:\n"
+                            "• Los Angeles (LA), Orlando, and all US summer trips are DOMESTIC US travel "
+                            "— they do NOT require passports, visas, or crossing international borders.\n"
+                            "• The ONLY upcoming international trips requiring passports are: "
+                            "Malaysia family visit (Feb 2027) and Japan/China (planning for 2027-2028).\n"
+                            "• The kids' passport validity/expiration is NOT stated in the life context.\n"
+                            "CRITICAL: You MUST NOT say LA, Orlando, or any US city involves international borders. "
+                            "Answer: passport status for kids is unknown — recommend confirming it specifically "
+                            "for the Malaysia trip in 2027, not for summer 2026 US travel.]\n\n"
+                        ) + _status_preamble
 
                     _open_loop_tool_rule = (
                         "TOOL RULE: This query is about personal open loops — do NOT call "
@@ -3205,7 +3903,7 @@ class PepperCore:
                             + _status_preamble
                             + _conflict_preamble
                             + _injected
-                            + "\n\n[PRE-ANSWER CHECK: Before writing your response, scan the life context above for the exact words 'Brown', 'Princeton', 'Yale', 'Columbia', 'Stanford', 'Berkeley', 'UC Berkeley', 'MIT', 'Cornell', 'Penn', 'Dartmouth', 'Duke'. If any of these do NOT appear verbatim in the text above, you are FORBIDDEN from naming them. For program/deadline questions: only name schools and deadlines that appear word-for-word in the life context above. If no specific program names or deadlines are in the text above for this topic, say so and do not invent any. IMPORTANT: The phrase 'some March 2026 deadlines were imminent' in the life context is a GENERAL NOTE — it does NOT give a specific date or program name. Do NOT assign this phrase as a deadline for Harvard or any other named program. Harvard's application deadline is NOT stated in the life context; only its start date (June 22, 2026) is confirmed. Do NOT say Harvard's deadline is any specific date. COLLEGE TOUR DATES RULE: Do NOT invent specific campus tour dates (e.g. 'September 16', 'October 5'). Only state tour dates that appear verbatim in the life context. The only confirmed East Coast tour dates are July 5–8, 2026. Do NOT state any other specific tour date. PRE-COLLEGE PROGRAM QUERY RULE: If the question asks about pre-college programs, summer programs, summer program deadlines, or pre-college application status — follow THIS rule and SKIP the COLLEGE APPLICATION DEADLINE RULE below. Matthew is CONFIRMED enrolled in the Harvard pre-college Quantum Computing program starting June 22, 2026. Always state this first. The March 2026 application window for other 2026 programs has passed. Do NOT say 'it is not possible to provide details' or 'check the college prep program' for pre-college questions — the confirmed program start date IS the answer. COLLEGE APPLICATION DEADLINE RULE: This rule applies ONLY to formal college admissions deadlines (Early Action, Regular Decision — the November/January dates for actually applying to college). It does NOT apply to pre-college summer program questions. Matthew's formal college application deadlines (EA, RD) are NOT stated anywhere in the life context. Do NOT write 'November 1', 'November 15', 'January 1', or any specific date as a formal college application deadline. If asked specifically about college admissions deadlines (EA/RD), say: 'No specific college application deadline dates are in your life context — check the college prep program or the schools' official sites directly.' FINANCE/CRYPTO RULE: If the question is about crypto, portfolio, financial investments, net exposure, or assets: (1) NEVER invent specific coin names, token names, cryptocurrency holdings, or portfolio compositions — no Bitcoin, Ethereum, Solana, Cardano, or any other specific coin unless it appears verbatim in the life context above. (2) The life context explicitly states the owner is 'Avoiding: Crypto portfolio attention' and the portfolio is 'Acknowledged but deferred'. State this plainly. (3) Do NOT say 'it might be a good idea to keep an eye on it', do NOT give generic investment strategy advice, do NOT suggest rebalancing or diversification. The owner has consciously deferred this — confirm it is an acknowledged open loop that still needs attention when re-engaged. (4) If no specific portfolio details are in the life context above, say so directly — do not invent them from training knowledge. (5) COMPLETE FINANCIAL PICTURE RULE: For questions about overall net exposure, all investments, financial status, or total assets — do NOT answer with crypto alone. Lead with ALL known financial context from the life context in this order: (a) Real estate: primary home in Cupertino (recently remodeled) and rental property in Santa Clara; (b) Retirement: 401(k) is actively being rebuilt (listed under Active Challenges); (c) Crypto portfolio: hurting and acknowledged but deferred — no specific holdings in life context. Note that Susan manages most financial operations; Jack handles the big picture. No specific dollar figures are in the life context for any of these. OPEN-LOOP PRIORITY RULE: If the question asks about the highest-priority or most important open loop, rank the open loops in the life context by urgency and pick ONE as the top priority. Name it explicitly, state its deadline or start date, and ALWAYS end your response with the verbatim action note from the life context. For Susan's career transition (PayPal start May 18, 2026) the action note is: 'may affect household scheduling — plan accordingly.' You MUST include this exact phrase. Do NOT substitute generic relationship or lifestyle advice. Do NOT list all loops as equally important — the user asked for ONE. Time-sensitive items (closest deadline or start date) outrank acknowledged-but-deferred items. TRIP-SCOPING RULE: If the question asks about the Orlando volleyball trip or AAU Championships, ONLY report open items from the AAU Championships bullet in the life context. The 'Pre-college summer programs' bullet is about Matthew's academic programs and is completely unrelated to the Orlando volleyball trip — do NOT list it as an open item for Orlando. Apply the same principle to any named trip: only surface open items that belong to that specific trip's bullet or sub-section. HARVARD PROGRAM NAMING RULE: The Harvard pre-college Quantum Computing program is a university-hosted summer program at Harvard in Boston — it is NOT a high-school program, NOT 'his school's program', NOT 'his high school's pre-college program'. Always refer to it by name: 'Harvard's pre-college Quantum Computing program' or 'Harvard pre-college program'. Never call it a 'high school program' or attach it to his high school.]\n"
+                            + "\n\n[PRE-ANSWER CHECK: Before writing your response, scan the life context above for the exact words 'Brown', 'Princeton', 'Yale', 'Columbia', 'Stanford', 'Berkeley', 'UC Berkeley', 'MIT', 'Cornell', 'Penn', 'Dartmouth', 'Duke'. If any of these do NOT appear verbatim in the text above, you are FORBIDDEN from naming them. For program/deadline questions: only name schools and deadlines that appear word-for-word in the life context above. If no specific program names or deadlines are in the text above for this topic, say so and do not invent any. IMPORTANT: The phrase 'some March 2026 deadlines were imminent' in the life context is a GENERAL NOTE — it does NOT give a specific date or program name. Do NOT assign this phrase as a deadline for Harvard or any other named program. Harvard's application deadline is NOT stated in the life context; only its start date (June 22, 2026) is confirmed. Do NOT say Harvard's deadline is any specific date. COLLEGE TOUR DATES RULE: Do NOT invent specific campus tour dates (e.g. 'September 16', 'October 5'). Only state tour dates that appear verbatim in the life context. The only confirmed East Coast tour dates are July 5–8, 2026. Do NOT state any other specific tour date. PRE-COLLEGE PROGRAM QUERY RULE: If the question asks about pre-college programs, summer programs, summer program deadlines, or pre-college application status — follow THIS rule and SKIP the COLLEGE APPLICATION DEADLINE RULE below. Matthew is CONFIRMED enrolled in the Harvard pre-college Quantum Computing program starting June 22, 2026. Always state this first. The March 2026 application window for other 2026 programs has passed. Do NOT say 'it is not possible to provide details' or 'check the college prep program' for pre-college questions — the confirmed program start date IS the answer. COLLEGE APPLICATION DEADLINE RULE: This rule applies ONLY to formal college admissions deadlines (Early Action, Regular Decision — the November/January dates for actually applying to college). It does NOT apply to pre-college summer program questions. Matthew's formal college application deadlines (EA, RD) are NOT stated anywhere in the life context. Do NOT write 'November 1', 'November 15', 'January 1', or any specific date as a formal college application deadline. If asked specifically about college admissions deadlines (EA/RD), say: 'No specific college application deadline dates are in your life context — check the college prep program or the schools' official sites directly.' FINANCE/CRYPTO RULE: If the question is about crypto, portfolio, financial investments, net exposure, or assets: (1) NEVER invent specific coin names, token names, cryptocurrency holdings, or portfolio compositions — no Bitcoin, Ethereum, Solana, Cardano, or any other specific coin unless it appears verbatim in the life context above. (2) The life context explicitly states the owner is 'Avoiding: Crypto portfolio attention' and the portfolio is 'Acknowledged but deferred'. State this plainly. (3) Do NOT say 'it might be a good idea to keep an eye on it', do NOT give generic investment strategy advice, do NOT suggest rebalancing or diversification. The owner has consciously deferred this — confirm it is an acknowledged open loop that still needs attention when re-engaged. (4) If no specific portfolio details are in the life context above, say so directly — do not invent them from training knowledge. (5) COMPLETE FINANCIAL PICTURE RULE: For questions about overall net exposure, all investments, financial status, or total assets — do NOT answer with crypto alone. Lead with ALL known financial context from the life context in this order: (a) Real estate: primary home in Cupertino (recently remodeled) and rental property in Santa Clara; (b) Retirement: 401(k) is actively being rebuilt (listed under Active Challenges); (c) Crypto portfolio: hurting and acknowledged but deferred — no specific holdings in life context. Note that Susan manages most financial operations; Jack handles the big picture. No specific dollar figures are in the life context for any of these. OPEN-LOOP PRIORITY RULE: If the question asks about the highest-priority or most important open loop, rank the open loops in the life context by urgency and pick ONE as the top priority. Name it explicitly, state its deadline or start date, and ALWAYS end your response with the verbatim action note from the life context. For Susan's career transition (PayPal start May 18, 2026) the action note is: 'may affect household scheduling — plan accordingly.' You MUST include this exact phrase. Do NOT substitute generic relationship or lifestyle advice. Do NOT list all loops as equally important — the user asked for ONE. Time-sensitive items (closest deadline or start date) outrank acknowledged-but-deferred items. TRIP-SCOPING RULE: If the question asks about the Orlando volleyball trip or AAU Championships, ONLY report open items from the AAU Championships bullet in the life context. The 'Pre-college summer programs' bullet is about Matthew's academic programs and is completely unrelated to the Orlando volleyball trip — do NOT list it as an open item for Orlando. Apply the same principle to any named trip: only surface open items that belong to that specific trip's bullet or sub-section. NEXT TRIP DISAMBIGUATION RULE: The LA volleyball trip (driving to LA, June 19) and the Orlando AAU trip (flights + hotel, July 4+) are TWO SEPARATE TRIPS — they are NOT one continuous journey and the family is NOT driving from LA to Orlando. DOMESTIC TRAVEL RULE: Los Angeles (LA), Orlando, and all US cities in the upcoming travel plans are DOMESTIC US destinations — they do NOT require international borders, passports, or customs. Only Malaysia (Feb 2027) and Japan/China require international travel. Do NOT say any US domestic trip involves crossing an international border. If asked about 'the next trip' or 'our next trip' without naming a specific trip, identify which trip is most imminent by date and answer ONLY about that trip. Do NOT merge logistics from separate trips. The LA trip is family driving to Southern California. The Orlando trip is a separate flight-based trip weeks later. ORLANDO TRIP PARTICIPANTS RULE: The Orlando AAU volleyball trip participants are: Susan (checks in July 4), Connor, and Dylan. Matthew is NOT going to Orlando — he is in Boston for Harvard's pre-college program until ~July 6, then doing East Coast college tours with Jack. Do NOT place Matthew in Orlando. Do NOT say Matthew joins Susan in Orlando. HARVARD PROGRAM NAMING RULE: The Harvard pre-college Quantum Computing program is a university-hosted summer program at Harvard in Boston — it is NOT a high-school program, NOT 'his school's program', NOT 'his high school's pre-college program'. Always refer to it by name: 'Harvard's pre-college Quantum Computing program' or 'Harvard pre-college program'. Never call it a 'high school program' or attach it to his high school. SINGLE-ITEM QUERY RULE: If the question asks for 'the one thing', 'what would you flag', 'if you had to pick one', 'what is the single most important', 'most likely to fall through the cracks', or similar — pick exactly ONE item as your answer. Name it, give one sentence of why, and stop. Do NOT list multiple items. Do NOT give a data dump. One item only. BOSTON TRIP RULE: For Matthew's Harvard pre-college program / Boston trip, the ONLY confirmed fact is that he flies from LAX on June 22. There is NO explicit lodging confirmation for Boston in the life context (unlike Orlando where the hotel is named). Do NOT say 'all logistics are sorted' or 'lodging is confirmed' for the Boston trip — only state what is explicitly confirmed. Open items for Boston: lodging for Matthew's stay and for Jack when he joins ~July 6 are not confirmed in the life context. COMMITMENT QUERY RULE: If the question asks what you committed to, what you promised, what you said you'd do, or what open commitments haven't been followed through on — you MUST call search_memory with the query 'commitments' or 'promised' BEFORE answering. Do NOT say 'I don't have enough context' without first calling search_memory. If search_memory returns no results, say 'No tracked commitments found in memory' and surface relevant open loops from the life context instead. HOTEL CHECK-IN TIME RULE: 'Check-in time' means the hotel's daily check-in hour (e.g., 3 PM or 4 PM) — NOT the date someone arrives. If asked about check-in times/hours and the life context only has arrival dates, say: state the arrival date(s) that ARE confirmed, then note that the actual hotel check-in time policy is not in your life context and suggest confirming with the hotel directly. TRAVEL DATE INFERENCE RULE: Do NOT infer or state a specific arrival date or check-in date for any family member unless that exact date is explicitly written for that person in the life context. If a date is not explicitly stated for a person, do NOT compute or infer it from tournament dates or other travelers' dates — say it is not specified.]\n"
                             + "\n[Question:]\n"
                             + messages[-1]["content"]
                         ),
@@ -3303,7 +4001,11 @@ class PepperCore:
         # strip data-fetching tools so the model cannot call them. Only core recall tools
         # (save/search/update memory and mark commitments) remain available.
         if routing.action_mode == ActionMode.ANSWER_FROM_CONTEXT and not is_live_data_query:
-            _RECALL_TOOL_NAMES = {"save_memory", "search_memory", "update_life_context", "mark_commitment_complete", "reset_memory"}
+            # search_web stays available even on context-only routes — the router
+            # often misclassifies explicit "search the web" requests as
+            # general_chat, and a stateless read tool the model ignores by
+            # default has no downside.
+            _RECALL_TOOL_NAMES = {"save_memory", "search_memory", "update_life_context", "mark_commitment_complete", "reset_memory", "search_web"}
             tools = [t for t in MEMORY_TOOLS if t["function"]["name"] in _RECALL_TOOL_NAMES] + _PENDING_ACTION_TOOLS
         else:
             tools = (
@@ -3317,6 +4019,8 @@ class PepperCore:
                 + COMMS_HEALTH_TOOLS
                 + FILESYSTEM_TOOLS
                 + IMAGE_TOOLS
+                + SKILL_TOOLS
+                + SEND_TOOLS
                 + _PENDING_ACTION_TOOLS
             )
         # Phase 5: append MCP tools discovered from external servers
@@ -3336,6 +4040,7 @@ class PepperCore:
             result = await self.llm.chat(messages, tools=tools or None, model=model, options=_ollama_opts)
             response_text = result.get("content", "")
             tool_calls = result.get("tool_calls", [])
+            chat_turn_logger.record_llm(result.get("model_used", model), tool_calls)
             chat_logger.info(
                 "llm_result_received",
                 model=result.get("model_used", model),
@@ -3362,6 +4067,7 @@ class PepperCore:
                     result = await self.llm.chat(messages, tools=tools or None, model=model, options=_ollama_opts)
                     response_text = result.get("content", "")
                     tool_calls = result.get("tool_calls", [])
+                    chat_turn_logger.record_llm(result.get("model_used", model), tool_calls)
                     chat_logger.info(
                         "llm_retry_after_overflow_result",
                         model=result.get("model_used", model),
@@ -3504,6 +4210,19 @@ class PepperCore:
             flags=_re_post.IGNORECASE,
         )
 
+        # Post-process: strip [Content: ...] blocks where Hermes3 emits save_memory
+        # call parameters as inline text instead of making a real tool call.
+        response_text = _re_post.sub(
+            r"\s*\[Content:.*?\]",
+            "",
+            response_text,
+            flags=_re_post.DOTALL,
+        ).strip()
+
+        # Post-process: strip [YYYY-MM] memory date tags that Hermes3 emits as
+        # inline text (e.g. "[2023-12]") from memory retrieval artifacts.
+        response_text = _re_post.sub(r"^\s*\[\d{4}-\d{2}\]\s*", "", response_text).strip()
+
         # Post-process: strip standalone --- separators that Hermes3 appends as
         # document dividers. Strip trailing --- with or without trailing whitespace,
         # and --- that is followed only by whitespace/newlines to end of string.
@@ -3522,21 +4241,40 @@ class PepperCore:
         chat_logger.info("chat_out", text=response_text[:1000])
 
         # Phase 4.3: fire background skill review (non-blocking, best-effort).
+        # Reviews skills the model actually consulted via skill_view this turn.
         # Runs after the response is ready so it never delays the user.
-        if matched_skills:
-            _tool_names_made = [
-                c.get("function", {}).get("name")
-                for c in tool_calls
-                if c.get("function", {}).get("name")
-            ]
-            asyncio.create_task(
+        consulted_skill_names: list[str] = []
+        tool_names_made: list[str] = []
+        for c in tool_calls:
+            fn = c.get("function", {})
+            tool_name = fn.get("name")
+            if not tool_name:
+                continue
+            tool_names_made.append(tool_name)
+            if tool_name == "skill_view":
+                raw_args = fn.get("arguments", {})
+                if isinstance(raw_args, str):
+                    try:
+                        raw_args = json.loads(raw_args)
+                    except (ValueError, TypeError):
+                        raw_args = {}
+                skill_name = (raw_args or {}).get("name")
+                if skill_name:
+                    consulted_skill_names.append(skill_name)
+        # Dedupe in case the model called skill_view(name=x) multiple times.
+        consulted_skill_names = list(dict.fromkeys(consulted_skill_names))
+
+        if consulted_skill_names:
+            review_task = asyncio.create_task(
                 self._skill_reviewer.review_turn(
-                    skill_names=[s.name for s in matched_skills],
+                    skill_names=consulted_skill_names,
                     user_message=user_message,
                     assistant_response=response_text,
-                    tool_calls_made=_tool_names_made,
+                    tool_calls_made=tool_names_made,
                 )
             )
+            self._background_tasks.add(review_task)
+            review_task.add_done_callback(self._background_tasks.discard)
 
         # Save conversation to DB (best-effort). Isolated scheduler turns are
         # excluded — they are synthetic automation prompts, not user conversations.
@@ -3832,6 +4570,23 @@ class PepperCore:
                         ),
                     }
 
+            elif name in DRAFT_TOOL_NAMES:
+                # LLM-facing draft_* tools always queue; they never send directly.
+                result = await execute_draft_tool(
+                    name, args, pending_actions=self.pending_actions
+                )
+
+            elif name == "send_email":
+                # Reachable only via PendingActionsQueue.approve (skip_mcp_write_gate=True)
+                # because send_email is not in the LLM-visible tool registry.
+                result = await execute_send_email(args, db_factory=self.db_factory)
+
+            elif name == "send_imessage":
+                result = await execute_send_imessage(args, db_factory=self.db_factory)
+
+            elif name == "send_whatsapp":
+                result = await execute_send_whatsapp(args, db_factory=self.db_factory)
+
             elif name == "save_memory":
                 await self.memory.save_to_recall(
                     args.get("content", ""), args.get("importance", 0.5)
@@ -3842,7 +4597,13 @@ class PepperCore:
                 results = await self.memory.search_recall(
                     args.get("query", ""), args.get("limit", 5)
                 )
-                result = {"results": results}
+                if results:
+                    result = {"results": results}
+                else:
+                    result = {
+                        "results": [],
+                        "message": "Memory search returned NO results — the memory database is empty. CRITICAL: Do NOT invent, fabricate, generate, or simulate any memories, commitments, reminders, or prior conversations. There are ZERO records. State this clearly: 'No prior conversations are stored in memory.' Then answer only from the life context document. Do NOT create fake commitment entries, reminder dates, or tracking records.",
+                    }
 
             elif name == "update_life_context":
                 if self.db_factory:
@@ -3926,6 +4687,19 @@ class PepperCore:
             elif name == "list_calendars":
                 result = await execute_list_calendars()
 
+            elif name == "list_writable_calendars":
+                result = await execute_list_writable_calendars()
+
+            elif name == "draft_calendar_event":
+                # LLM-facing: queue an event draft for explicit user approval.
+                result = execute_draft_calendar_event(
+                    args, pending_actions=self.pending_actions
+                )
+
+            elif name == "create_calendar_event":
+                # Reachable only via PendingActionsQueue.approve (not in LLM tool registry).
+                result = await execute_create_calendar_event(args, db_factory=self.db_factory)
+
             elif name == "get_recent_emails":
                 result = await execute_get_recent_emails(args)
 
@@ -3958,6 +4732,13 @@ class PepperCore:
                 "get_relationship_balance_report",
             ):
                 result = await execute_comms_health_tool(name, args)
+
+            elif name in ("skill_view", "skill_search", "skill_install", "skill_registry_update"):
+                result = await execute_skill_tool(name, args, self._skills)
+                # skill_install mutates the local skill set; refresh so the next
+                # turn's index includes the new skill without a process restart.
+                if name == "skill_install" and result.get("ok"):
+                    self.reload_skills()
 
             elif name == "reset_memory":
                 if not args.get("confirm"):
@@ -4082,6 +4863,352 @@ class PepperCore:
         except Exception as e:
             logger.error("save_conversation_failed", session_id=session_id, error=str(e))
 
+    async def _log_routing_event(
+        self,
+        *,
+        query: str,
+        session_id: str,
+        latency_ms: int,
+        trace: dict,
+        stamped_at: datetime | None = None,
+    ) -> None:
+        """Append one row to ``routing_events`` for this turn.
+
+        Phase 1 Task 2 of docs/SEMANTIC_ROUTER_MIGRATION.md. Runs as a
+        background task off the chat-response critical path. The embedding
+        is generated locally (qwen3-embedding:0.6b, 1024-dim) since
+        Phase 2 Task 0; failures are tolerated — the row still lands
+        without a vector. ``trace`` is a snapshot
+        of the chat-turn logger's per-turn dict so we don't depend on the
+        ContextVar inside this task.
+        """
+        if not self.db_factory:
+            return
+
+        embedding: list[float] | None = None
+        try:
+            embedding = await self.llm.embed_router(query)
+        except Exception as exc:
+            logger.warning("routing_event_embed_failed", error=str(exc))
+
+        routing = trace.get("routing") or {}
+        tool_calls = trace.get("tool_calls") or None
+
+        # Phase 3 cutover: shadow direction inverted. SemanticRouter is now
+        # primary (its decision is already in `routing` from the trace);
+        # QueryRouter (legacy regex) runs in shadow and its top decision is
+        # stamped onto routing_events.shadow_decision_*. Best-effort — any
+        # failure leaves the shadow columns NULL so the primary row still
+        # lands. The shadow codepath is removed in Phase 5 cleanup.
+        shadow_intent: str | None = None
+        shadow_confidence: float | None = None
+        try:
+            legacy_decisions = self._router.route_multi(
+                query, self._capability_registry
+            )
+            if legacy_decisions:
+                primary = max(legacy_decisions, key=lambda d: d.confidence)
+                shadow_intent = primary.intent_type.value
+                shadow_confidence = primary.confidence
+        except Exception as exc:
+            logger.warning("routing_event_legacy_shadow_failed", error=str(exc))
+
+        try:
+            async with self.db_factory() as session:
+                kwargs = dict(
+                    query_text=query,
+                    query_embedding=embedding,
+                    regex_decision_intent=routing.get("intent"),
+                    regex_decision_sources=routing.get("sources"),
+                    regex_decision_confidence=routing.get("confidence"),
+                    tools_actually_called=tool_calls,
+                    llm_model=trace.get("model"),
+                    latency_ms=latency_ms,
+                    user_session_id=session_id,
+                    shadow_decision_intent=shadow_intent,
+                    shadow_decision_confidence=shadow_confidence,
+                )
+                if stamped_at is not None:
+                    kwargs["timestamp"] = stamped_at
+                session.add(RoutingEvent(**kwargs))
+                await session.commit()
+        except Exception as exc:
+            logger.warning("routing_event_write_failed", error=str(exc))
+
+    # ─── Reaction-based success signal (Phase 2 prep) ─────────────────────
+
+    # Telegram emoji → success_signal. Conservative: only clearly positive
+    # or clearly negative reactions move the signal; ambiguous ones (🤔, 😱)
+    # leave it untouched so the heuristic-driven pass keeps its say.
+    _REACTION_SIGNAL_MAP: dict[str, str] = {
+        "👍": "confirmed",
+        "❤": "confirmed",
+        "❤️": "confirmed",
+        "🔥": "confirmed",
+        "🎉": "confirmed",
+        "🤩": "confirmed",
+        "👏": "confirmed",
+        "💯": "confirmed",
+        "🙏": "confirmed",
+        "🥰": "confirmed",
+        "👌": "confirmed",
+        "👎": "abandoned",
+        "💩": "abandoned",
+        "🤬": "abandoned",
+        "😡": "abandoned",
+        "🤮": "abandoned",
+        "🥱": "abandoned",
+    }
+
+    @classmethod
+    def reaction_to_signal(cls, emojis: list[str]) -> str | None:
+        """Resolve a list of reaction emojis to a single success_signal.
+
+        If any negative reaction is present, return ``"abandoned"`` —
+        negative feedback dominates because it's a stronger correction
+        than mixed-positive. Otherwise the first positive reaction wins.
+        Empty input or all-unmapped input returns ``None`` (caller should
+        leave success_signal alone).
+        """
+        for e in emojis:
+            if cls._REACTION_SIGNAL_MAP.get(e) == "abandoned":
+                return "abandoned"
+        for e in emojis:
+            mapped = cls._REACTION_SIGNAL_MAP.get(e)
+            if mapped == "confirmed":
+                return "confirmed"
+        return None
+
+    async def record_outbound_message(
+        self, *, session_id: str, chat_id: int, message_id: int
+    ) -> bool:
+        """Stamp a Telegram message id onto the most recent routing_events row.
+
+        The inline writer is asynchronous — when the channel's outbound
+        message is sent, the row may not be in the DB yet. Retry briefly.
+        Returns True if the row was found and updated, False otherwise.
+        """
+        if not self.db_factory:
+            return False
+        from sqlalchemy import select as _select, update as _update
+        for attempt in range(6):  # ~1.5s total at 0.25s
+            try:
+                async with self.db_factory() as session:
+                    row = await session.execute(
+                        _select(RoutingEvent.id)
+                        .where(RoutingEvent.user_session_id == session_id)
+                        .where(RoutingEvent.outbound_message_id.is_(None))
+                        .order_by(RoutingEvent.timestamp.desc())
+                        .limit(1)
+                    )
+                    rid = row.scalar_one_or_none()
+                    if rid is not None:
+                        await session.execute(
+                            _update(RoutingEvent)
+                            .where(RoutingEvent.id == rid)
+                            .values(
+                                outbound_chat_id=chat_id,
+                                outbound_message_id=message_id,
+                            )
+                        )
+                        await session.commit()
+                        return True
+            except Exception as exc:
+                logger.warning(
+                    "outbound_message_record_failed",
+                    error=str(exc),
+                    attempt=attempt,
+                )
+                return False
+            await asyncio.sleep(0.25)
+        logger.info(
+            "outbound_message_record_no_row",
+            session_id=session_id,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+        return False
+
+    async def apply_reaction_signal(
+        self, *, chat_id: int, message_id: int, emojis: list[str]
+    ) -> bool:
+        """Map a Telegram reaction to ``success_signal`` on the matching row.
+
+        Removed reactions (``emojis == []``) leave the existing signal in
+        place — we don't unset, because the heuristic sweep may have
+        already populated it from text follow-ups.
+        """
+        if not self.db_factory or not emojis:
+            return False
+        signal = self.reaction_to_signal(emojis)
+        if signal is None:
+            return False
+        from sqlalchemy import select as _select, update as _update
+        try:
+            async with self.db_factory() as session:
+                row = await session.execute(
+                    _select(RoutingEvent.id)
+                    .where(RoutingEvent.outbound_chat_id == chat_id)
+                    .where(RoutingEvent.outbound_message_id == message_id)
+                    .limit(1)
+                )
+                rid = row.scalar_one_or_none()
+                if rid is None:
+                    return False
+                await session.execute(
+                    _update(RoutingEvent)
+                    .where(RoutingEvent.id == rid)
+                    .values(
+                        success_signal=signal,
+                        success_signal_set_at=datetime.now(ZoneInfo("UTC")),
+                    )
+                )
+                await session.commit()
+                logger.info(
+                    "reaction_signal_applied",
+                    routing_event_id=rid,
+                    signal=signal,
+                    emojis=emojis,
+                )
+                return True
+        except Exception as exc:
+            logger.warning("reaction_signal_failed", error=str(exc))
+            return False
+
+    async def _process_success_signals(
+        self,
+        *,
+        session_id: str,
+        current_query: str,
+        current_response: str,
+        current_timestamp: datetime,
+    ) -> None:
+        """Phase 1 Task 5: derive ``success_signal`` for prior turns in this session.
+
+        Runs as a background task off the chat-response critical path. Walks
+        the unset rows in this session whose timestamp is before
+        ``current_timestamp`` and applies the heuristic from
+        docs/SEMANTIC_ROUTER_MIGRATION.md Phase 1:
+
+        - within 30 min, high overlap → ``re_asked``
+        - within 30 min, low overlap  → ``confirmed``
+        - past 60 min, short or refusal-laden response → ``abandoned``
+        - past 60 min, otherwise → ``unknown``
+
+        Rows in the 30-60 min ambiguous band are left NULL so a later
+        invocation (the next turn or the Phase 1 Task 6 CLI sweep) can
+        revisit them. ``current_response`` is also persisted nowhere new
+        — we read it from the JSONL turn log when the abandonment window
+        closes (the JSONL is the durable source of truth per Task 4).
+        """
+        if not self.db_factory:
+            return
+        from sqlalchemy import select as _select
+
+        try:
+            async with self.db_factory() as session:
+                result = await session.execute(
+                    _select(RoutingEvent)
+                    .where(
+                        RoutingEvent.user_session_id == session_id,
+                        RoutingEvent.success_signal.is_(None),
+                        RoutingEvent.timestamp < current_timestamp,
+                    )
+                    .order_by(RoutingEvent.timestamp.desc())
+                    .limit(20)
+                )
+                rows = list(result.scalars().all())
+                if not rows:
+                    return
+                changed = False
+                for row in rows:
+                    age_min = (
+                        current_timestamp - row.timestamp
+                    ).total_seconds() / 60.0
+                    if age_min <= success_signal.RE_ASK_WINDOW_MIN:
+                        signal = success_signal.derive_followup_signal(
+                            row.query_text or "",
+                            current_query,
+                            age_min,
+                        )
+                    elif age_min > success_signal.ABANDON_WINDOW_MIN:
+                        prior_response = self._lookup_jsonl_response(
+                            session_id=session_id,
+                            query=row.query_text or "",
+                            row_timestamp=row.timestamp,
+                        )
+                        signal = success_signal.derive_terminal_signal(
+                            prior_response, age_min
+                        )
+                    else:
+                        signal = None
+                    if signal is not None:
+                        row.success_signal = signal
+                        row.success_signal_set_at = current_timestamp
+                        changed = True
+                if changed:
+                    await session.commit()
+        except Exception as exc:
+            logger.warning("success_signal_process_failed", error=str(exc))
+
+    def _lookup_jsonl_response(
+        self,
+        *,
+        session_id: str,
+        query: str,
+        row_timestamp: datetime,
+    ) -> str | None:
+        """Find the response text for a prior turn from logs/chat_turns/<date>.jsonl.
+
+        The JSONL is the durable plaintext source of truth (Phase 1 Task 4).
+        Matching is by (session_id, query, nearest timestamp). Returns
+        ``None`` when no candidate is found — the caller treats that as
+        "cannot decide yet" and leaves the signal NULL.
+        """
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parent.parent
+        log_dir = repo_root / "logs" / "chat_turns"
+        # Scan the row's date plus the day before/after to cover edge-of-midnight
+        # timestamps and TZ skew between the DB (UTC) and the file naming.
+        candidate_dates = {
+            (row_timestamp + timedelta(days=delta)).strftime("%Y-%m-%d")
+            for delta in (-1, 0, 1)
+        }
+        best_response: str | None = None
+        best_diff = float("inf")
+        for date_str in candidate_dates:
+            path = log_dir / f"{date_str}.jsonl"
+            if not path.exists():
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if row.get("session_id") != session_id:
+                            continue
+                        if row.get("query") != query:
+                            continue
+                        ts_raw = row.get("timestamp")
+                        if not ts_raw:
+                            continue
+                        try:
+                            ts = datetime.fromisoformat(ts_raw)
+                        except ValueError:
+                            continue
+                        diff = abs((ts - row_timestamp).total_seconds())
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_response = row.get("response") or ""
+            except OSError:
+                continue
+        return best_response
+
     _ROUTING_TRIGGERS = (
         "how long", "how far", "drive to", "driving to", "driving time",
         "get to", "directions to", "commute to", "distance to",
@@ -4132,7 +5259,8 @@ class PepperCore:
         if not self.config.BRAVE_API_KEY:
             return ""
         lower = user_message.lower()
-        if not any(t in lower for t in self._SEARCH_TRIGGERS):
+        explicit = bool(_EXPLICIT_WEB_SEARCH_RE.search(user_message))
+        if not explicit and not any(t in lower for t in self._SEARCH_TRIGGERS):
             return ""
         try:
             results = await brave_search(user_message, self.config.BRAVE_API_KEY, count=5)

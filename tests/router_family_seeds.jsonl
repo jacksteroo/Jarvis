@@ -1,0 +1,13 @@
+{"query": "How is my dad doing these days?", "pattern_id": "family-status", "notes": "Person-state query; single-relative status read. Distinct from family-01..04.", "intent_label": "person_lookup"}
+{"query": "Any update on my mom lately?", "pattern_id": "family-status", "notes": "Generic relative-status follow-up; no multi-source phrasing.", "intent_label": "person_lookup"}
+{"query": "What's going on with my sister?", "pattern_id": "family-status", "notes": "Single-relative state query.", "intent_label": "person_lookup"}
+{"query": "Tell me how my brother has been", "pattern_id": "family-status", "notes": "Person-history retrieval.", "intent_label": "person_lookup"}
+{"query": "Catch me up on my cousin", "pattern_id": "family-status", "notes": "Single-person state read.", "intent_label": "person_lookup"}
+{"query": "When did I last text my mom?", "pattern_id": "family-conversation", "notes": "Time-scoped messaging history with one relative; conversation_lookup not person_lookup.", "intent_label": "conversation_lookup"}
+{"query": "Did I reply to my dad's last message?", "pattern_id": "family-conversation", "notes": "Reply-state for one relative.", "intent_label": "conversation_lookup"}
+{"query": "Pull up my recent thread with my brother", "pattern_id": "family-conversation", "notes": "Thread retrieval with relative.", "intent_label": "conversation_lookup"}
+{"query": "How long since I spoke to my sister?", "pattern_id": "family-conversation", "notes": "Time-since-contact for one relative.", "intent_label": "conversation_lookup"}
+{"query": "Should I take the kids to visit grandma this summer?", "pattern_id": "family-life-question", "notes": "Open-ended life question; no concrete subsystem call.", "intent_label": "general_chat"}
+{"query": "Is it time to start planning a family reunion?", "pattern_id": "family-life-question", "notes": "Speculative life question.", "intent_label": "general_chat"}
+{"query": "How old will my niece be next year?", "pattern_id": "family-trivia", "notes": "Trivia/reasoning question; mirror of family-07.", "intent_label": "general_chat"}
+{"query": "What year did my parents get married?", "pattern_id": "family-trivia", "notes": "Family trivia recall; general_chat.", "intent_label": "general_chat"}

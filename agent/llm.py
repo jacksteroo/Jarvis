@@ -258,8 +258,23 @@ class ModelClient:
         raise ClassifiedLLMError(ErrorCategory.UNKNOWN, "Max LLM retry attempts exceeded.")
 
     async def embed(self, text: str) -> list[float]:
-        """Generate an embedding vector.  Always local — never calls external API."""
-        return await self._local_embed(text)
+        """Generate an embedding vector.  Always local — never calls external API.
+
+        Uses ``nomic-embed-text`` (768-dim). This is the memory subsystem's
+        embedder; do not switch it without coordinating a re-embed of
+        ``memory_events`` and ``conversations``.
+        """
+        return await self._local_embed(text, model="nomic-embed-text")
+
+    async def embed_router(self, text: str) -> list[float]:
+        """Generate a router-side embedding (``qwen3-embedding:0.6b``, 1024-dim).
+
+        Phase 2 Task 0 of docs/SEMANTIC_ROUTER_MIGRATION.md split the router
+        and memory embedders onto separate models so the semantic router can
+        use a stronger embedding without forcing the memory subsystem to
+        re-embed. Always local.
+        """
+        return await self._local_embed(text, model="qwen3-embedding:0.6b")
 
     # ------------------------------------------------------------------
     # Private — Ollama
@@ -474,19 +489,19 @@ class ModelClient:
     # Private — local embeddings
     # ------------------------------------------------------------------
 
-    async def _local_embed(self, text: str) -> list[float]:
+    async def _local_embed(self, text: str, *, model: str = "nomic-embed-text") -> list[float]:
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(
                         f"{self.config.OLLAMA_BASE_URL}/api/embeddings",
-                        json={"model": "nomic-embed-text", "prompt": text},
+                        json={"model": model, "prompt": text},
                     )
                     resp.raise_for_status()
                     embedding = resp.json().get("embedding", [])
                     if not embedding:
                         raise ValueError(
-                            "Ollama returned empty embedding — is nomic-embed-text pulled?"
+                            f"Ollama returned empty embedding — is {model} pulled?"
                         )
                     return embedding
             except Exception as exc:

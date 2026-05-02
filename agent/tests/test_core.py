@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 def make_mock_config():
     config = MagicMock()
-    config.LIFE_CONTEXT_PATH = "docs/LIFE_CONTEXT.md"
+    config.LIFE_CONTEXT_PATH = "data/life_context.md"
     config.OWNER_NAME = "Jack Chan"
     config.TIMEZONE = "UTC"
     config.DEFAULT_LOCAL_MODEL = "hermes-4.3-36b-tools:latest"
@@ -17,7 +17,8 @@ def make_mock_config():
 def make_mock_llm():
     llm = AsyncMock()
     llm.chat.return_value = {"content": "Hello, I'm Pepper.", "tool_calls": []}
-    llm.embed.return_value = [0.1] * 768
+    llm.embed.return_value = [0.1] * 768  # nomic-embed-text (memory)
+    llm.embed_router.return_value = [0.1] * 1024  # qwen3-embedding:0.6b (router)
     llm.config = MagicMock()
     llm.config.DEFAULT_LOCAL_MODEL = "hermes-4.3-36b-tools:latest"
     return llm
@@ -810,6 +811,72 @@ async def test_pepper_core_cross_source_triage_uses_priority_summary_bypass():
         assert "Email:" in response
         assert "iMessage:" in response
         mock_llm.chat.assert_not_called()
+
+
+def test_build_calendar_query_window_prefers_tomorrow_over_negated_today():
+    """'I'm asking about meetings tomorrow, not today' must select the tomorrow
+    window, not the today window."""
+    from agent.core import PepperCore
+
+    config = make_mock_config()
+    config.TIMEZONE = "America/Los_Angeles"
+
+    with patch("agent.core.ModelClient"), \
+         patch("agent.core.MemoryManager"), \
+         patch("agent.core.ToolRouter"), \
+         patch("agent.core.build_system_prompt", return_value="system"), \
+         patch("agent.core.CommitmentExtractor"):
+        pepper = PepperCore(config)
+        args, label = pepper._build_calendar_query_window(
+            "I'm asking about meetings tomorrow, not today"
+        )
+        assert label == "tomorrow"
+        # Window must start tomorrow (not midnight today).
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        start = datetime.fromisoformat(args["start_date"])
+        now_local = datetime.now(ZoneInfo("America/Los_Angeles"))
+        assert start.date() > now_local.date()
+
+
+def test_build_calendar_query_window_today_and_tomorrow_combined():
+    from agent.core import PepperCore
+
+    config = make_mock_config()
+    config.TIMEZONE = "America/Los_Angeles"
+
+    with patch("agent.core.ModelClient"), \
+         patch("agent.core.MemoryManager"), \
+         patch("agent.core.ToolRouter"), \
+         patch("agent.core.build_system_prompt", return_value="system"), \
+         patch("agent.core.CommitmentExtractor"):
+        pepper = PepperCore(config)
+        args, label = pepper._build_calendar_query_window(
+            "what's on my schedule today and tomorrow"
+        )
+        assert label == "today and tomorrow"
+        from datetime import datetime
+        start = datetime.fromisoformat(args["start_date"])
+        end = datetime.fromisoformat(args["end_date"])
+        assert (end - start).days == 1  # 2-day window minus 1 sec
+
+
+def test_build_calendar_query_window_tomorrow_only():
+    from agent.core import PepperCore
+
+    config = make_mock_config()
+    config.TIMEZONE = "America/Los_Angeles"
+
+    with patch("agent.core.ModelClient"), \
+         patch("agent.core.MemoryManager"), \
+         patch("agent.core.ToolRouter"), \
+         patch("agent.core.build_system_prompt", return_value="system"), \
+         patch("agent.core.CommitmentExtractor"):
+        pepper = PepperCore(config)
+        args, label = pepper._build_calendar_query_window(
+            "when is my next meeting tomorrow morning?"
+        )
+        assert label == "tomorrow"
 
 
 def test_config_model_routing():

@@ -28,6 +28,12 @@ services:
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       RUNNING_IN_DOCKER: "1"
       PYTHONPATH: /app
+      # Hermes-agent skills registry — read-only mount of the host path.
+      # Override PEPPER_HERMES_SKILLS_PATH in .env to point elsewhere or disable.
+      PEPPER_HERMES_SKILLS_PATH: /data/hermes-skills
+      # WhatsApp send bridge — talks to the sibling service over the docker
+      # network. PEPPER_WA_BRIDGE_TOKEN comes from .env (env_file above).
+      PEPPER_WA_BRIDGE_URL: http://whatsapp-bridge:3025
     ports:
       - "8000:8000"
     volumes:
@@ -40,7 +46,18 @@ services:
       # Live-reload source during development
       - ./agent:/app/agent
       - ./subsystems:/app/subsystems
-      - ./docs:/app/docs
+      # Project documentation — read-only. Pepper reads it for context but
+      # must not write to it; mutable per-owner state lives in ./data below.
+      - ./docs:/app/docs:ro
+      # User-mutable state — life_context.md and any future per-owner files
+      # Pepper writes back to. Gitignored on the host; survives rebuilds.
+      - ./data:/app/data:rw
+      # Skills — repo legacy skills (5 flat .md files) read-only
+      - ./skills:/app/skills:ro
+      # User-installed skills + anthropics registry mirror persist on host
+      - ${HOME}/.pepper:/root/.pepper:rw
+      # Hermes-agent skill registry (read-only) for skill_search/skill_install
+      - /Users/jack/Developer/nousresearch/hermes-agent/skills:/data/hermes-skills:ro
       # iMessage — requires Docker Desktop to have Full Disk Access
       # (System Settings → Privacy & Security → Full Disk Access → Docker Desktop)
       - ${HOME}/Library/Messages:/data/messages:ro
@@ -49,8 +66,43 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      whatsapp-bridge:
+        # service_started, NOT service_healthy: the bridge is unhealthy until
+        # QR pairing completes on first launch. Pepper can run fine without
+        # the bridge — WhatsApp send tools will surface a clear error if the
+        # bridge isn't ready yet, while every other channel keeps working.
+        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  whatsapp-bridge:
+    build: ./subsystems/communications/whatsapp_bridge
+    image: pepper-whatsapp-bridge:latest
+    container_name: pepper-whatsapp-bridge
+    restart: unless-stopped
+    # Read PEPPER_WA_TOKEN (and any future bridge envs) straight from .env so
+    # the user only manages one secrets file. The bridge's auth middleware
+    # checks `x-pepper-token`, which Pepper sends as `PEPPER_WA_BRIDGE_TOKEN`
+    # — we re-export the same value under both names below.
+    env_file: .env
+    environment:
+      PORT: "3025"
+      HOST: "0.0.0.0"
+      PEPPER_WA_TOKEN: ${PEPPER_WA_BRIDGE_TOKEN:-}
+    ports:
+      # Bound to localhost only — never expose this port off-host.
+      - "127.0.0.1:3025:3025"
+    volumes:
+      # Persistent WhatsApp Web session. Survives container rebuilds, so QR
+      # pairing is one-time. WhatsApp itself may force a re-link if the phone
+      # hasn't opened WhatsApp in ~14 days, but that's their policy.
+      - whatsapp_session:/app/.wa_session
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:3025/health | grep -q ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   web:
     image: node:20-alpine
@@ -80,3 +132,4 @@ services:
 volumes:
   postgres_data:
   huggingface_cache:
+  whatsapp_session:

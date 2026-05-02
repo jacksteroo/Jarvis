@@ -54,6 +54,8 @@ class IntentType(str, Enum):
     SCHEDULE_LOOKUP = "schedule_lookup"
     CROSS_SOURCE_TRIAGE = "cross_source_triage"
     GENERAL_CHAT = "general_chat"
+    UNSUPPORTED_CAPABILITY = "unsupported_capability"
+    WEB_LOOKUP = "web_lookup"
     UNKNOWN = "unknown"
 
 
@@ -84,6 +86,23 @@ class RoutingDecision:
 
 
 # ── Deterministic pattern tables ──────────────────────────────────────────────
+
+# Explicit web-search trigger. Tighter than the proactive _SEARCH_TRIGGERS list
+# in core.py — only fires on phrases the user can only mean to ask the public
+# internet (so "search my memory" doesn't trip it). "google" as a verb at the
+# start of a clause counts ("google what time..."); a bare noun "Google" does
+# not, because the look-behind requires a clause boundary or polite prefix.
+_EXPLICIT_WEB_SEARCH_RE = re.compile(
+    r"(?:^|[.;,!?]\s+|\b(?:can you|could you|please)\s+)"
+    r"(?:"
+    r"search the web|search online|search google|"
+    r"google\b|"
+    r"look (?:it|that|this) up|look up online|"
+    r"find online|web search|"
+    r"on the (?:internet|web)"
+    r")",
+    re.IGNORECASE,
+)
 
 # Specific capability check phrases
 _CAPABILITY_RE = re.compile(
@@ -130,11 +149,22 @@ _CROSS_SOURCE_TERMS = (
     "who do i owe", "who needs a reply", "owe replies", "owe a reply",
     "what needs my attention", "what am i missing", "anything important",
     "catch me up", "what came in", "what's new", "what is new",
+    # "What did I miss in messages coming in?" etc. — generic catch-up phrasing
+    # that should fan out to all messaging channels rather than be answered by
+    # the LLM (which hallucinates with hermes3).
+    "what did i miss", "did i miss anything", "anything i missed",
+    "messages coming in", "incoming messages", "any incoming",
+    "what came through", "anything come through",
     "anything overnight", "anything this morning", "anything urgent",
     "triage", "anything i should", "what should i know", "what do i need to know",
     "what's going on", "any updates", "anything to know",
     "check my messages", "my messages", "check messages",
     "any word from", "word from", "hear from anyone",
+    "trying to reach me", "reached out to me", "reached out recently",
+    "who reached out", "who messaged me", "who contacted me",
+    "gotten back to", "haven't gotten back", "not gotten back",
+    "haven't replied to", "haven't responded to", "not replied to",
+    "still haven't", "owe a reply", "owe replies",
     "on my plate", "most important", "give me a brief", "quick brief",
     "what needs my", "what should i focus", "what should i prioritize",
     "what's most important", "what is most important",
@@ -389,6 +419,11 @@ def _infer_target_sources(text: str) -> list[str]:
     if contains_any(normalized, CALENDAR_QUERY_TERMS):
         sources.append("calendar")
 
+    # Generic "messages"/"message" with no specific channel → fan out to all
+    # messaging channels (but not calendar, which isn't messages).
+    if not sources and contains_any(normalized, ("message", "messages", "messaging")):
+        sources = ["email", "imessage", "whatsapp", "slack"]
+
     return sources
 
 
@@ -434,6 +469,24 @@ class QueryRouter:
             contains_any(normalized, _COMPOUND_ACTION_INDICATORS)
             or bool(_COMPOUND_MODAL_RE.search(user_message))
         )
+
+        # ── 0. Explicit web-search request ─────────────────────────────────────
+        # "search the web", "google it", "look it up online" etc. — the user is
+        # asking us to hit the public internet. Route as WEB_LOOKUP with
+        # CALL_TOOLS so the search_web tool gets invoked rather than falling
+        # through to general_chat / answer_from_context.
+        if _EXPLICIT_WEB_SEARCH_RE.search(user_message):
+            d = RoutingDecision(
+                intent_type=IntentType.WEB_LOOKUP,
+                target_sources=[],
+                action_mode=ActionMode.CALL_TOOLS,
+                time_scope=time_scope,
+                entity_targets=entity_targets,
+                confidence=1.0,
+                reasoning="explicit web-search trigger",
+            )
+            self._log(user_message, d)
+            return d
 
         # ── 1. Generic capability check ────────────────────────────────────────
         if contains_any(normalized, _GENERIC_CAPABILITY_TERMS) and not is_compound:
@@ -513,6 +566,29 @@ class QueryRouter:
                 time_scope=time_scope,
                 entity_targets=entity_targets,
                 reasoning="life-context mutation — answer from life context with memory tools",
+            )
+            self._log(user_message, d)
+            return d
+
+        # ── 2d. Family-academic / life-context advisory queries ───────────────────
+        # Questions like "should I be doing anything to help the boys' grades?"
+        # match "anything i should" in _CROSS_SOURCE_TERMS but are fully answerable
+        # from life context — no inbox triage needed. Intercept before triage.
+        _FAMILY_LIFE_CONTEXT_TERMS = (
+            "grades", "homework", "school performance", "study", "studying",
+            "college prep", "college planning", "college applications",
+            "help the boys", "help my kids", "help my children", "help my son",
+            "help my daughter", "kids' school", "kids' grades", "their grades",
+            "academic", "academics", "tutor", "tutoring",
+        )
+        if contains_any(normalized, _FAMILY_LIFE_CONTEXT_TERMS):
+            d = RoutingDecision(
+                intent_type=IntentType.CROSS_SOURCE_TRIAGE,
+                target_sources=[],
+                action_mode=ActionMode.ANSWER_FROM_CONTEXT,
+                time_scope=time_scope,
+                entity_targets=entity_targets,
+                reasoning="family-academic life-context query — answer from context",
             )
             self._log(user_message, d)
             return d

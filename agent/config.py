@@ -33,8 +33,11 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_ALLOWED_USER_IDS: str = ""  # comma-separated string
 
-    # Life context
-    LIFE_CONTEXT_PATH: str = "docs/LIFE_CONTEXT.md"
+    # Life context — user-mutable state, lives under data/, not docs/.
+    # docs/ is for project documentation (architecture, principles); data/
+    # is for files Pepper writes back to (life_context.md and future
+    # per-user state). docs/LIFE_CONTEXT.md.example remains the template.
+    LIFE_CONTEXT_PATH: str = "data/life_context.md"
     OWNER_NAME: str = "the owner"
 
     # Timezone (IANA name, e.g. "America/Los_Angeles", "America/New_York")

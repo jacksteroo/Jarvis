@@ -60,16 +60,28 @@ class PendingAction:
         }
 
 
+Notifier = Callable[[PendingAction], Awaitable[None]]
+
+
 class PendingActionsQueue:
     """In-memory queue of proposed outbound actions awaiting user decision."""
 
     def __init__(self, executor: Optional[Executor] = None) -> None:
         self._items: dict[str, PendingAction] = {}
         self._executor = executor
+        self._notifier: Optional[Notifier] = None
 
     def set_executor(self, executor: Executor) -> None:
         """Wire the tool dispatcher that `approve()` uses to actually run the action."""
         self._executor = executor
+
+    def set_notifier(self, notifier: Optional[Notifier]) -> None:
+        """Wire a callback that fires whenever a new draft is enqueued.
+
+        Used to surface drafts in the Telegram chat (with inline approve / edit
+        / reject buttons). Failures inside the notifier never block enqueue.
+        """
+        self._notifier = notifier
 
     # ── Writes ─────────────────────────────────────────────────────────────────
 
@@ -97,6 +109,15 @@ class PendingActionsQueue:
             tool=tool_name,
             preview=item.preview[:160],
         )
+        if self._notifier is not None:
+            try:
+                import asyncio
+                asyncio.create_task(self._notifier(item))
+            except RuntimeError:
+                # No running loop (e.g. unit test) — skip notification.
+                pass
+            except Exception as exc:
+                logger.warning("pending_action_notify_failed", id=action_id, error=str(exc))
         return item
 
     def edit(self, action_id: str, edited_body: str) -> Optional[PendingAction]:

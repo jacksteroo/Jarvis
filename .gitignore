@@ -10,11 +10,30 @@ build/
 *.egg-info/
 .DS_Store
 .claude/
+.router_build.lock
 *.sqlite
 *.log
 logs/*
-docs/LIFE_CONTEXT.md
+
+# User-mutable state — life_context.md and any future per-user files.
+# Personal data lives under data/, never under docs/. The .gitkeep
+# survives clones so the mount target exists; everything else is local.
+data/*
+!data/.gitkeep
 
 # Local config — personal data, never commit
 config/local/*
 !config/local/.gitkeep
+
+# Router snapshot dumps — contain raw query_text from real usage,
+# stay local-only (privacy boundary). Phase-completion diffs in
+# backups/router/*.diff are code changes and may be committed.
+backups/router/phase_*_pre_reembed_*/
+backups/router/phase_*_pre_promotion_*/
+backups/router/phase_*_pre_shadow_rereplay_*/
+backups/router/phase_*_pre_battery_relabel/
+backups/router/phase_*_pre_interactive_fix_*/
+backups/router/phase_*_pre_cutover_*/
+backups/router/*.csv
+backups/router/*.jsonl
+backups/router/*.sql

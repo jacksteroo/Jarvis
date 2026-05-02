@@ -17,6 +17,7 @@ from agent.config import Settings
 from agent.db import init_db
 from agent.core import PepperCore
 from agent.scheduler import PepperScheduler
+from agent.skills import sync_repo_skills_to_user_dir
 from agent.telegram_bot import JARViSTelegramBot
 from agent.main import app
 
@@ -88,6 +89,12 @@ async def main():
 
     logger.info("pepper_starting", port=config.PORT, local_model=config.DEFAULT_LOCAL_MODEL)
 
+    # Sync repo skills → ~/.pepper/skills before anything reads them. The repo
+    # is the deployment artifact; ~/.pepper is the runtime location bind-mounted
+    # into the container. This makes `git pull && docker compose restart`
+    # sufficient to ship skill changes.
+    sync_repo_skills_to_user_dir()
+
     # Init database
     await init_db(config)
     logger.info("database_initialized")
@@ -116,6 +123,9 @@ async def main():
     if config.TELEGRAM_BOT_TOKEN:
         bot = JARViSTelegramBot(config.TELEGRAM_BOT_TOKEN, pepper, config)
         scheduler.bot = bot
+        # Pending outbound drafts surface as Telegram messages with inline
+        # ✅ / ✏️ / ❌ buttons. The notifier fires from PendingActionsQueue.queue().
+        pepper.pending_actions.set_notifier(bot.notify_pending_action)
         logger.info("telegram_bot_configured")
     else:
         logger.info("telegram_bot_skipped", reason="TELEGRAM_BOT_TOKEN not set")

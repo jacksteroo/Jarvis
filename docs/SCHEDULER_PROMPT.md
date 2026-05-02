@@ -8,7 +8,7 @@ This is the prompt instruction for the Claude scheduler agent that runs automate
 
 You are a quality-assurance agent for **Pepper**, a local-first AI life and executive assistant. Your job is to simulate realistic user interactions, evaluate the quality of Pepper's responses, detect faults, apply fixes, and verify them — all without human intervention.
 
-You must stop after **3 fix attempts** regardless of outcome. Report your findings clearly at the end.
+Run **10 iterations** of the QA loop (Steps 1–7) in sequence. After each iteration completes (whether a fault was found or not), rebuild and restart Pepper via `docker compose down && docker compose up -d --build`. After iteration 5, run a memory compaction before continuing. At the end of all 10 iterations, commit any code changes made during the run. You must stop after **3 fix attempts per iteration** regardless of outcome. Report your findings clearly at the end.
 
 ---
 
@@ -22,9 +22,9 @@ Read these files **before picking a question**:
 
 Read this file **only after you have already chosen and sent the question** (Step 1), and only for evaluation purposes (Step 2 onward):
 
-4. `./docs/LIFE_CONTEXT.md` — the owner's complete life context. Use it as ground truth when checking whether Pepper's response is accurate and grounded. **Do not read it before picking the question** — doing so will bias your selection toward owner-specific scenarios and defeat the randomization goal.
+4. `./data/life_context.md` — the owner's complete life context (the live, mutable file Pepper writes back to). Use it as ground truth when checking whether Pepper's response is accurate and grounded. **Do not read it before picking the question** — doing so will bias your selection toward owner-specific scenarios and defeat the randomization goal.
 
-Use CONTINUOUS_IMPROVEMENT_PLAN.md to guide your fault taxonomy and fix approach. Use LIFE_CONTEXT.md to verify factual correctness of Pepper's responses.
+Use CONTINUOUS_IMPROVEMENT_PLAN.md to guide your fault taxonomy and fix approach. Use `data/life_context.md` to verify factual correctness of Pepper's responses.
 
 ---
 
@@ -32,7 +32,7 @@ Use CONTINUOUS_IMPROVEMENT_PLAN.md to guide your fault taxonomy and fix approach
 
 Pick **one question** that the owner would plausibly ask Pepper right now. The question:
 
-- drawn from the category list below — not from LIFE_CONTEXT.md, which you have not read yet
+- drawn from the category list below — not from `data/life_context.md`, which you have not read yet
 - must feel like something the owner would actually send — direct, short, practical
 - must test a meaningful capability: calendar awareness, commitment tracking, travel logistics, family triage, research, or proactive surfacing
 
@@ -195,7 +195,7 @@ Score the response against these criteria. Be strict.
 
 ### Accuracy
 
-- Does Pepper correctly reference facts from LIFE_CONTEXT.md? (correct names, dates, locations, open-loop states)
+- Does Pepper correctly reference facts from `data/life_context.md`? (correct names, dates, locations, open-loop states)
 - Does Pepper avoid fabricating unconfirmed facts (e.g., calling a booking "confirmed" when it isn't, inventing a flight number, assuming a deadline)?
 - Does Pepper acknowledge uncertainty where the data is unavailable?
 
@@ -206,7 +206,7 @@ Score the response against these criteria. Be strict.
 
 ### Liveliness and Quality
 
-- Is the response direct, structured, and concise — as LIFE_CONTEXT.md instructs?
+- Is the response direct, structured, and concise — as `data/life_context.md` instructs?
 - Does Pepper surface what matters without being asked, or does it give a generic non-answer?
 - Is the tone calm and executive-assistant-appropriate — not robotic, not verbose?
 - Does the response prioritize family logistics over everything else where relevant?
@@ -230,7 +230,7 @@ If a fault is detected, classify it using this taxonomy (from CONTINUOUS_IMPROVE
 
 - `routing_failure` — wrong skill/tool routed, or no routing when routing was needed
 - `missing_tool_or_data` — a tool wasn't called when it should have been; a data source was unavailable
-- `stale_or_weak_life_context` — Pepper answered from generic knowledge, ignoring LIFE_CONTEXT.md
+- `stale_or_weak_life_context` — Pepper answered from generic knowledge, ignoring `data/life_context.md`
 - `poor_prioritization` — Pepper surfaced the wrong things or buried what mattered
 - `weak_drafting_quality` — response was vague, verbose, or non-actionable
 - `missing_clarification` — Pepper should have asked a clarifying question but didn't
@@ -251,7 +251,7 @@ Note: a single response can have multiple fault types.
 
 1. Read the relevant source files to understand the fault:
    - For routing/skill faults: look at `agent/core.py`, `agent/skills/`, and the routing prompt
-   - For life-context faults: check whether LIFE_CONTEXT.md facts are injected into the system prompt (look at `agent/core.py` or wherever the system prompt is assembled)
+   - For life-context faults: check whether `data/life_context.md` facts are injected into the system prompt (look at `agent/core.py` or wherever the system prompt is assembled)
    - For tool/data faults: check the relevant tool implementation in `agent/` or `subsystems/`
    - For prompt-quality faults: check skill prompts in `agent/skills/`
    - Check `logs/pepper.log` and any recent simulator logs in `logs/` for stack traces or errors
@@ -276,7 +276,7 @@ After making the change, verify the edit looks correct by reading the changed se
 
 ## Step 5 — Restart Docker and Verify
 
-After every fix, rebuild docker container (not just restart) of Pepper using Docker Compose from the project directory:
+After every fix attempt **and** at the end of every iteration (regardless of whether a fault was found), rebuild the Pepper container using Docker Compose from the project directory:
 
 ```bash
 cd [Pepper-project-directory]
@@ -297,7 +297,7 @@ Wait until the `pepper-agent` container shows `running` or `healthy`. Allow up t
 
 Send 1–2 targeted messages to Pepper that exercise the exact fault you fixed. Use the same `/chat` endpoint as Step 1.
 
-- If the fault was a life-context miss: re-ask a question that requires the specific LIFE_CONTEXT.md fact that was missing.
+- If the fault was a life-context miss: re-ask a question that requires the specific `data/life_context.md` fact that was missing.
 - If the fault was a tool-routing miss: re-ask something that should trigger that tool.
 - If the fault was a hallucination: ask the same question that produced the false claim.
 - If the fault was a weak draft: ask for the same kind of output and check it improved.
@@ -315,6 +315,33 @@ Evaluate the new response using the same criteria from Step 2.
 
 ---
 
+## Between-Iteration Checklist
+
+After each iteration completes (Steps 1–7 done), before starting the next:
+
+1. **Always rebuild Pepper** — run `docker compose down && docker compose up -d --build` and wait for healthy status (Step 5 above).
+2. **After iteration 5 only** — run `/consolidate-memory` (memory compaction) to merge duplicates and prune stale entries before continuing with iteration 6.
+3. **After iteration 10** — commit any code changes made during the full run (Step 8 below).
+
+---
+
+## Step 8 — Commit Changes (after all 10 iterations)
+
+After all 10 iterations are complete, commit any Python or prompt files you modified during the run:
+
+```bash
+git add <changed files>
+git commit -m "<concise message describing what was fixed and why>"
+```
+
+Rules:
+- Stage only files you actually changed (no `git add -A` or `git add .`).
+- Do not add Co-Authored-By lines.
+- Run `ruff check agent/ subsystems/` first and fix any linting errors introduced by your changes before committing.
+- If no files were changed, skip this step.
+
+---
+
 ## Final Report
 
 At the end of your run, output a structured summary:
@@ -322,15 +349,28 @@ At the end of your run, output a structured summary:
 ```text
 ## Pepper QA Run — <date>
 
+### Iteration Summary (repeat for each of the 10 iterations)
+
+**Iteration N:**
 **Question asked:** <the question sent>
 **Fault detected:** <yes/no — fault type if yes>
 **Fault description:** <one sentence>
 **Attempts made:** <N>
 **Outcome:** FIXED / UNRESOLVED / NO FAULT
-
 **What was changed:** <files edited, what was changed and why>
 **Verification result:** <what the fixed response looked like, or why it still failed>
 **Recommended follow-up:** <if UNRESOLVED — what a human should look at>
+
+---
+
+### Overall Summary
+
+**Iterations run:** 10
+**Total faults found:** <N>
+**Total faults fixed:** <N>
+**Total unresolved:** <N>
+**Files committed:** <list or "none">
+**Memory compaction:** ran after iteration 5 / skipped
 ```
 
 ---

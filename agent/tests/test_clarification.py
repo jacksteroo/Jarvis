@@ -10,7 +10,7 @@ from agent.query_router import RoutingDecision, IntentType, ActionMode
 def _make_core():
     from agent.core import PepperCore
     config = MagicMock()
-    config.LIFE_CONTEXT_PATH = "docs/LIFE_CONTEXT.md"
+    config.LIFE_CONTEXT_PATH = "data/life_context.md"
     config.OWNER_NAME = "Jack Chan"
     config.TIMEZONE = "UTC"
     config.DEFAULT_LOCAL_MODEL = "hermes-4.3-36b-tools:latest"

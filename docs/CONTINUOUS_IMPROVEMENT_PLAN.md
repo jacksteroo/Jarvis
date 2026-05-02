@@ -171,7 +171,7 @@ Create a single decision layer that every proactive Pepper behavior uses.
 - keyword urgency
 - event type
 - time of day (+ quiet hours)
-- owner preferences from `docs/LIFE_CONTEXT.md`
+- owner preferences from `data/life_context.md`
 - source confidence / capability status
 - news severity and local relevance
 

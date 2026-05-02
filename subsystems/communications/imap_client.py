@@ -12,8 +12,11 @@ from __future__ import annotations
 import email
 import imaplib
 import json
+import smtplib
 from datetime import datetime, timedelta
 from email.header import decode_header
+from email.message import EmailMessage
+from email.utils import make_msgid
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "pepper"
@@ -25,6 +28,13 @@ IMAP_PROVIDERS: dict[str, tuple[str, int]] = {
     "gmail": ("imap.gmail.com", 993),
     "outlook": ("outlook.office365.com", 993),
     "icloud": ("imap.mail.me.com", 993),
+}
+
+SMTP_PROVIDERS: dict[str, tuple[str, int]] = {
+    "yahoo": ("smtp.mail.yahoo.com", 587),
+    "gmail": ("smtp.gmail.com", 587),
+    "outlook": ("smtp.office365.com", 587),
+    "icloud": ("smtp.mail.me.com", 587),
 }
 
 
@@ -140,3 +150,76 @@ class ImapClient:
             return len(ids[0].split())
         finally:
             conn.logout()
+
+    def _resolve_thread_headers(self, in_reply_to_id: str) -> tuple[str | None, str | None]:
+        """Fetch the parent message's Message-ID and References for threading."""
+        conn = self._connect()
+        try:
+            conn.select("INBOX", readonly=True)
+            _, data = conn.fetch(in_reply_to_id.encode(), "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REFERENCES)])")
+            if not data or not data[0]:
+                return None, None
+            raw = data[0][1]
+            parsed = email.message_from_bytes(raw)
+            parent_msgid = (parsed.get("Message-ID") or "").strip() or None
+            refs = (parsed.get("References") or "").strip()
+            new_refs = (refs + " " + parent_msgid).strip() if parent_msgid else (refs or None)
+            return parent_msgid, new_refs
+        except Exception:
+            return None, None
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    def send_message(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        in_reply_to_id: str | None = None,
+        cc: str | None = None,
+        bcc: str | None = None,
+    ) -> dict:
+        """Send a plain-text email via SMTP. Returns {'id', 'from'}.
+
+        Threading: when in_reply_to_id (an IMAP message id) is supplied, the
+        parent's Message-ID/References are looked up and added to the new mail.
+        """
+        creds = load_credentials(self.account_name)
+        provider = creds.get("provider", "yahoo")
+        host, port = SMTP_PROVIDERS.get(provider, (creds.get("smtp_host", ""), int(creds.get("smtp_port", 587))))
+        from_addr = creds["email"]
+
+        msg = EmailMessage()
+        msg["From"] = from_addr
+        msg["To"] = to
+        if cc:
+            msg["Cc"] = cc
+        if bcc:
+            msg["Bcc"] = bcc
+        msg["Subject"] = subject
+        msg["Message-ID"] = make_msgid()
+        msg.set_content(body)
+
+        if in_reply_to_id:
+            parent_msgid, refs = self._resolve_thread_headers(in_reply_to_id)
+            if parent_msgid:
+                msg["In-Reply-To"] = parent_msgid
+            if refs:
+                msg["References"] = refs
+
+        recipients = [r.strip() for r in to.split(",") if r.strip()]
+        if cc:
+            recipients += [r.strip() for r in cc.split(",") if r.strip()]
+        if bcc:
+            recipients += [r.strip() for r in bcc.split(",") if r.strip()]
+
+        with smtplib.SMTP(host, port, timeout=20) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.login(creds["email"], creds["password"])
+            smtp.send_message(msg, from_addr=from_addr, to_addrs=recipients)
+
+        return {"id": msg["Message-ID"], "from": from_addr}

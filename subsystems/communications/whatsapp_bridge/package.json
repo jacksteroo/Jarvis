@@ -1,0 +1,19 @@
+{
+  "name": "pepper-whatsapp-bridge",
+  "version": "0.1.0",
+  "description": "Local-only HTTP send bridge for Pepper. Reads stay on the macOS SQLite path; this process only handles outbound sends through whatsapp-web.js.",
+  "private": true,
+  "type": "commonjs",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.23.0"
+  }
+}
