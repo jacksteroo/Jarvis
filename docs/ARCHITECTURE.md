@@ -2,15 +2,50 @@
 
 ## Overview
 
-Pepper is a layered system. The orchestrator agent sits at the center with full life context. Specialized subsystems feed it structured data. A maintenance layer keeps the whole system healthy. A security layer watches everything.
+Pepper is a three-layer system. **Layer 1 — Data** brings the operator's world into the machine. **Layer 2 — Intelligence** is the agent runtime that reasons over that world. **Layer 3 — Presentation** is how the operator and Pepper meet. The orchestrator sits in Layer 2 with full life context; specialised subsystems sit in Layer 1; Telegram, the web app, and the future macOS shell sit in Layer 3. A maintenance layer keeps the whole system healthy and a security layer watches everything; both cut across the three.
 
 Nothing is monolithic. Every layer is independently replaceable.
 
 > Architectural decisions that shape this system are recorded in [`adr/`](adr/). When a section here cites an ADR, that ADR is the binding source for the decision — this document is the descriptive surface. `docs/GUARDRAILS.md` still takes precedence over any ADR.
 
+This document leads with the layered framing because it is the framing the active roadmap is sequenced against ([ADR-0003](adr/0003-layer-2-is-the-active-surface.md)). The earlier subsystem-horizontal framing — useful for capability decomposition — is preserved as [Appendix B: Capability Decomposition (View B)](#appendix-b-capability-decomposition-view-b) at the end of this document. Both views describe the same system; the layered view is canonical, the capability view is a complementary cross-section. The choice is captured in [issue #15](https://github.com/jacksteroo/Pepper/issues/15).
+
 ---
 
-## Layer Model
+## Three Layers
+
+Pepper has three load-bearing layers. They are not equal in maturity at any given moment — see [ADR-0003](adr/0003-layer-2-is-the-active-surface.md) for the current ranking.
+
+### Layer 1 — Data
+
+The operator's world made available to the agent. Today this includes Gmail, Yahoo Mail, iMessage, WhatsApp, Slack, Telegram, Google Calendar, the persistent memory store (PostgreSQL + pgvector), and the life-context document. Future Layer 1 expansions (Knowledge, Health, Finance) are paused per [ADR-0001](adr/0001-resequence-around-oj-calibration.md) until substrate work in Layer 2 lands.
+
+The privacy invariant lives here: raw data stays local, processed locally, never leaves the machine. Layer 1 is what makes that invariant enforceable. As of 2026-05, Layer 1 is **mature** for the next two sprints — bug fixes only, no new sources.
+
+### Layer 2 — Intelligence
+
+The agent runtime. Pepper Core (orchestrator), the semantic intent router, prompt assembly, retrieval, the skill system, the MCP client, the routing-event store, and — once the substrate phase lands — the trace store, hybrid retrieval, reflection runtime, and learned routing/prompt optimization. The cognitive agents introduced by [ADR-0004](adr/0004-introduce-agents-directory.md) (`agents/reflector/`, `agents/monitor/`, …) are Layer 2 inhabitants.
+
+Per [ADR-0003](adr/0003-layer-2-is-the-active-surface.md), Layer 2 is the **active surface** for the next two sprints: comprehension regressions are diagnosed here first, new investments land here, and roadmap items that propose new Layer 1 sources during this window are deferred to `WISHLIST.md`.
+
+### Layer 3 — Presentation
+
+How Pepper meets the operator. Telegram is the primary interface today; the local React + Vite web app is secondary; a notarized macOS desktop app is the next platform direction (see [`MACOS_DESKTOP_APP_PLAN.md`](MACOS_DESKTOP_APP_PLAN.md)). Voice is on the wishlist.
+
+Layer 3 is in steady state. A better presentation layer over a confused agent would be a demo, not a tool, so Layer 3 work is not the active surface during the Layer 2 window.
+
+### Cross-cutting layers
+
+Two layers cut across the three:
+
+- **Maintenance** — Claude Code schedulers, model evaluation and swap, health monitoring, self-healing agents, zero-downtime upgrades.
+- **Security** — red-team adversarial agents, prompt-injection testing, anomaly detection, full audit logging, the "agents on agents" KGB model.
+
+Both touch every layer and are therefore not numbered alongside them.
+
+---
+
+## Layer-to-component mapping
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -154,91 +189,6 @@ Tool definitions follow Anthropic's function calling format:
 ```
 
 This contract means any subsystem can be replaced without modifying Pepper Core. Current subsystems (calendar, email) are designed with this future split in mind.
-
----
-
-## Current Subsystem Status
-
-### COMMUNICATIONS Layer (Phase 2) — ✅ Complete
-
-**Built:**
-
-- Gmail integration via OAuth2 (`subsystems/communications/gmail_client.py`)
-- Yahoo Mail via IMAP (`subsystems/communications/imap_client.py`)
-- Tools: `get_recent_emails`, `search_emails`, `get_email_unread_counts`
-- **iMessage reader** (`subsystems/communications/imessage_client.py`) — reads local `~/Library/Messages/chat.db`
-  - Tools: `get_recent_imessages`, `get_imessage_conversation`, `search_imessages`
-  - Parameterized SQL, graceful degradation if Full Disk Access not granted
-- **WhatsApp integration** (`subsystems/communications/whatsapp_client.py`) — reads local `ChatStorage.sqlite`
-  - Tools: `get_recent_whatsapp_chats`, `get_whatsapp_chat`, `search_whatsapp`, `get_whatsapp_groups`
-  - Fallback: parses WhatsApp `.txt` chat exports
-- **Slack integration** (`subsystems/communications/slack_client.py`) — Slack Bot API (read-only)
-  - Tools: `search_slack`, `get_slack_channel_messages`, `get_slack_deadlines`, `list_slack_channels`
-  - Deadline detection via regex patterns ("due Friday", "by EOD", "ship by", etc.)
-  - Requires `SLACK_BOT_TOKEN` in `.env`
-- **Contact enrichment** (`subsystems/communications/contact_enricher.py`)
-  - Cross-references contacts across iMessage, WhatsApp, email
-  - Tools: `get_contact_profile`, `find_quiet_contacts`, `search_contacts`
-- **Communication health dashboard** (`agent/comms_health_tools.py`)
-  - Tools: `get_comms_health_summary`, `get_overdue_responses`, `get_relationship_balance_report`
-  - Integrated into morning brief (surfaces 1-2 signals)
-  - API endpoint: `GET /comms-health`
-  - Web UI tab: "Relationships" (`web/src/components/Relationships.tsx`)
-- Proactive context injection for all channels when relevant keywords mentioned
-
-### TIME Layer (Phase 2) — ✅ Complete
-
-**Built:**
-
-- Google Calendar integration via OAuth2 (`subsystems/calendar/`)
-- Multi-account support with per-account calendar selection and display name overrides (`subsystems/calendar/preferences.py`)
-- Tools: `get_upcoming_events` (next 90 days), `get_calendar_events_range` (arbitrary past/future date range), `list_calendars`
-- Proactive context injection when schedule mentioned
-- Unified Google auth shared with Gmail (`subsystems/google_auth.py`)
-
-**Deferred (wishlist):**
-
-- Pre-event intelligence (30 min before events) — planned as a Phase 4 skill
-- Deadline tracking from Slack — planned as a Phase 4 skill
-- Commitment tracking from conversation promise language — planned as a Phase 4 skill
-
-### Additional Capabilities
-
-- **Web search** (`agent/web_search.py`) — Brave Search API; includes `brave_image_search` for image queries
-- **Image search** — `search_images` tool calls `brave_image_search`; LLM embeds results as `[IMAGE:url]` markers that the Telegram bot renders as inline photos
-- **Routing** (`agent/routing.py`) — Google Maps Distance Matrix API with live traffic
-- **Account management** (`agent/accounts.py`) — Centralized gitignored config for personal data
-
-### RUNTIME Layer (Phase 3) — ✅ Complete
-
-- **Parallel tool execution** (`agent/tool_router.py`) — read-only tools dispatched concurrently via `asyncio.gather`; side-effect tools execute sequentially in model-produced order
-- **Context compression** (`agent/context_compressor.py`) — auto-compresses long conversations before hitting the model's context window; always runs on local Ollama (privacy invariant enforced)
-- **Error classifier + smart fallback** (`agent/error_classifier.py`) — typed `ErrorCategory` / `DataSensitivity` error handling; classified retry loop; privacy invariant preserved under all failure modes
-- **Semantic intent router** (`agent/semantic_router.py`) — Phase 3 cutover (2026-04-29): k-NN intent classifier over per-intent exemplar embeddings (`qwen3-embedding:0.6b`, pgvector HNSW). Primary router; legacy regex `agent/query_router.py` runs in shadow alongside it (writes to `routing_events.shadow_decision_*`) until Phase 5 cleanup removes the codepath. Capability-registry filtering applied as a deterministic post-route step. Pre-commit eval gate (`scripts/git-hooks/pre-commit-router-eval`, ≥85% on `tests/router_eval_set.jsonl`) gates router-relevant edits. See `docs/SEMANTIC_ROUTER.md` for operating details.
-
-### SKILL SYSTEM (Phase 4) — ✅ Complete
-
-- **Skill files** (`skills/*.md`) — YAML frontmatter + workflow markdown
-- **Skill injection** (`agent/skills.py`) — trigger matching + prompt injection
-- **Self-improving** (`agent/skill_reviewer.py`) — background review + human-approved diffs
-- 5 working skills: morning_brief, weekly_review, commitment_check, draft_reply_to_contact, prep_for_meeting
-
-### MCP INTEGRATION (Phase 5) — ✅ Complete
-
-- **MCP Client** (`agent/mcp_client.py`) — connects to external MCP servers via stdio, discovers tools, routes calls
-- **MCP Audit** (`agent/mcp_audit.py`) — privacy-preserving trust levels (local/trusted/external), data classification, audit logging
-- **Subsystem MCP servers** (`subsystems/calendar/mcp_server.py`, `subsystems/communications/mcp_server.py`) — subsystems exposed as standalone MCP services
-- **Pepper as MCP Server** (`agent/mcp_server.py`) — exposes safe subset of tools to Claude Desktop/Code/Cursor
-- **Privacy enforcement**: `RAW_PERSONAL_TOOLS` (iMessage, WhatsApp, email, Slack, memory) NEVER reach external/trusted servers; 59 regression tests
-- Configuration: `config/mcp_servers.yaml` (external servers), `config/mcp_server_access.yaml` (access control)
-
-### Not Yet Started
-
-- **PEOPLE** — future People subsystem integration (post Phase 5)
-- **KNOWLEDGE** (post Phase 5) — Notes, documents, decision log
-- **HEALTH** (post Phase 5) — health data ingestion (Apple Health export, Oura Ring, Garmin, Whoop, and others)
-- **FINANCE** (post Phase 5) — Bank CSV parsing
-- **macOS DESKTOP APP** — Swift shell, embedded PostgreSQL, no Docker
 
 ---
 
@@ -400,3 +350,94 @@ Security     ←→  All components  via audit log tailing + probe endpoints
 ```
 
 All inter-component communication is localhost or LAN. External connections: Telegram bot API (interface only), Claude API (summaries only, optional), Google APIs (Calendar/Gmail, optional), Brave Search (optional), Google Maps (optional), and model download endpoints (one-time, for model pulls).
+
+---
+
+## Appendix B: Capability Decomposition (View B)
+
+The body of this document presents Pepper as three layers (Data, Intelligence, Presentation), which is the canonical framing per [ADR-0003](adr/0003-layer-2-is-the-active-surface.md) and [issue #15](https://github.com/jacksteroo/Pepper/issues/15). The same system can also be read as a horizontal decomposition into capability subsystems and runtime phases — useful when you want to know *what is built today* and *which subsystem owns which tools*. That decomposition is preserved below, unchanged.
+
+If the two views ever drift, the layered framing in the body wins and this appendix is updated to match.
+
+### Current subsystem status (capability view)
+
+#### COMMUNICATIONS Layer (Phase 2) — ✅ Complete
+
+**Built:**
+
+- Gmail integration via OAuth2 (`subsystems/communications/gmail_client.py`)
+- Yahoo Mail via IMAP (`subsystems/communications/imap_client.py`)
+- Tools: `get_recent_emails`, `search_emails`, `get_email_unread_counts`
+- **iMessage reader** (`subsystems/communications/imessage_client.py`) — reads local `~/Library/Messages/chat.db`
+  - Tools: `get_recent_imessages`, `get_imessage_conversation`, `search_imessages`
+  - Parameterized SQL, graceful degradation if Full Disk Access not granted
+- **WhatsApp integration** (`subsystems/communications/whatsapp_client.py`) — reads local `ChatStorage.sqlite`
+  - Tools: `get_recent_whatsapp_chats`, `get_whatsapp_chat`, `search_whatsapp`, `get_whatsapp_groups`
+  - Fallback: parses WhatsApp `.txt` chat exports
+- **Slack integration** (`subsystems/communications/slack_client.py`) — Slack Bot API (read-only)
+  - Tools: `search_slack`, `get_slack_channel_messages`, `get_slack_deadlines`, `list_slack_channels`
+  - Deadline detection via regex patterns ("due Friday", "by EOD", "ship by", etc.)
+  - Requires `SLACK_BOT_TOKEN` in `.env`
+- **Contact enrichment** (`subsystems/communications/contact_enricher.py`)
+  - Cross-references contacts across iMessage, WhatsApp, email
+  - Tools: `get_contact_profile`, `find_quiet_contacts`, `search_contacts`
+- **Communication health dashboard** (`agent/comms_health_tools.py`)
+  - Tools: `get_comms_health_summary`, `get_overdue_responses`, `get_relationship_balance_report`
+  - Integrated into morning brief (surfaces 1-2 signals)
+  - API endpoint: `GET /comms-health`
+  - Web UI tab: "Relationships" (`web/src/components/Relationships.tsx`)
+- Proactive context injection for all channels when relevant keywords mentioned
+
+#### TIME Layer (Phase 2) — ✅ Complete
+
+**Built:**
+
+- Google Calendar integration via OAuth2 (`subsystems/calendar/`)
+- Multi-account support with per-account calendar selection and display name overrides (`subsystems/calendar/preferences.py`)
+- Tools: `get_upcoming_events` (next 90 days), `get_calendar_events_range` (arbitrary past/future date range), `list_calendars`
+- Proactive context injection when schedule mentioned
+- Unified Google auth shared with Gmail (`subsystems/google_auth.py`)
+
+**Deferred (wishlist):**
+
+- Pre-event intelligence (30 min before events) — planned as a Phase 4 skill
+- Deadline tracking from Slack — planned as a Phase 4 skill
+- Commitment tracking from conversation promise language — planned as a Phase 4 skill
+
+#### Additional Capabilities
+
+- **Web search** (`agent/web_search.py`) — Brave Search API; includes `brave_image_search` for image queries
+- **Image search** — `search_images` tool calls `brave_image_search`; LLM embeds results as `[IMAGE:url]` markers that the Telegram bot renders as inline photos
+- **Routing** (`agent/routing.py`) — Google Maps Distance Matrix API with live traffic
+- **Account management** (`agent/accounts.py`) — Centralized gitignored config for personal data
+
+#### RUNTIME Layer (Phase 3) — ✅ Complete
+
+- **Parallel tool execution** (`agent/tool_router.py`) — read-only tools dispatched concurrently via `asyncio.gather`; side-effect tools execute sequentially in model-produced order
+- **Context compression** (`agent/context_compressor.py`) — auto-compresses long conversations before hitting the model's context window; always runs on local Ollama (privacy invariant enforced)
+- **Error classifier + smart fallback** (`agent/error_classifier.py`) — typed `ErrorCategory` / `DataSensitivity` error handling; classified retry loop; privacy invariant preserved under all failure modes
+- **Semantic intent router** (`agent/semantic_router.py`) — Phase 3 cutover (2026-04-29): k-NN intent classifier over per-intent exemplar embeddings (`qwen3-embedding:0.6b`, pgvector HNSW). Primary router; legacy regex `agent/query_router.py` runs in shadow alongside it (writes to `routing_events.shadow_decision_*`) until Phase 5 cleanup removes the codepath. Capability-registry filtering applied as a deterministic post-route step. Pre-commit eval gate (`scripts/git-hooks/pre-commit-router-eval`, ≥85% on `tests/router_eval_set.jsonl`) gates router-relevant edits. See `docs/SEMANTIC_ROUTER.md` for operating details.
+
+#### SKILL SYSTEM (Phase 4) — ✅ Complete
+
+- **Skill files** (`skills/*.md`) — YAML frontmatter + workflow markdown
+- **Skill injection** (`agent/skills.py`) — trigger matching + prompt injection
+- **Self-improving** (`agent/skill_reviewer.py`) — background review + human-approved diffs
+- 5 working skills: morning_brief, weekly_review, commitment_check, draft_reply_to_contact, prep_for_meeting
+
+#### MCP INTEGRATION (Phase 5) — ✅ Complete
+
+- **MCP Client** (`agent/mcp_client.py`) — connects to external MCP servers via stdio, discovers tools, routes calls
+- **MCP Audit** (`agent/mcp_audit.py`) — privacy-preserving trust levels (local/trusted/external), data classification, audit logging
+- **Subsystem MCP servers** (`subsystems/calendar/mcp_server.py`, `subsystems/communications/mcp_server.py`) — subsystems exposed as standalone MCP services
+- **Pepper as MCP Server** (`agent/mcp_server.py`) — exposes safe subset of tools to Claude Desktop/Code/Cursor
+- **Privacy enforcement**: `RAW_PERSONAL_TOOLS` (iMessage, WhatsApp, email, Slack, memory) NEVER reach external/trusted servers; 59 regression tests
+- Configuration: `config/mcp_servers.yaml` (external servers), `config/mcp_server_access.yaml` (access control)
+
+#### Not Yet Started
+
+- **PEOPLE** — future People subsystem integration (post Phase 5)
+- **KNOWLEDGE** (post Phase 5) — Notes, documents, decision log
+- **HEALTH** (post Phase 5) — health data ingestion (Apple Health export, Oura Ring, Garmin, Whoop, and others)
+- **FINANCE** (post Phase 5) — Bank CSV parsing
+- **macOS DESKTOP APP** — Swift shell, embedded PostgreSQL, no Docker

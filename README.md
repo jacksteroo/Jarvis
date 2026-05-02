@@ -14,7 +14,7 @@ A sovereign, local-first AI life assistant. Knows your life context deeply. Runs
 - **Email integration** — checks inbox across Gmail and Yahoo accounts, searches emails, surfaces unread counts
 - **Web search** — can search the web (Brave Search API) when needed
 - **Navigation** — calculates driving time with live traffic (Google Maps API)
-- **Extensible** — subsystem architecture means iMessage, health, finance, notes plug in over time
+- **Extensible** — three-layer architecture (Data / Intelligence / Presentation) with capability subsystems at Layer 1 means iMessage, health, finance, notes plug in over time
 
 ---
 
@@ -187,7 +187,7 @@ file is persisted on the host.
 ### Documentation
 
 - **[GUARDRAILS.md](docs/GUARDRAILS.md)** — Development guardrails based on OpenAI's harness engineering (read this first!)
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — System architecture and subsystem design
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — System architecture: three-layer framing (Data / Intelligence / Presentation), with the subsystem decomposition preserved as an appendix
 - **[ROADMAP.md](docs/ROADMAP.md)** — Phase-by-phase build plan
 - **[CONTINUOUS_IMPROVEMENT_PLAN.md](docs/CONTINUOUS_IMPROVEMENT_PLAN.md)** — How Pepper gets iteratively better through evals, simulated chats, and judgment-focused upgrades
 - **[CLAUDE.md](CLAUDE.md)** — Instructions for Claude Code when working on this project
