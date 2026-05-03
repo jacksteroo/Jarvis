@@ -15,6 +15,7 @@
 import { useEffect, useState } from 'react'
 import {
   api,
+  type MemoryDetail,
   type RerenderPromptResponse,
   type TraceDetail,
 } from '../api'
@@ -37,6 +38,15 @@ const styles = {
     fontWeight: 600,
     marginBottom: 16,
     letterSpacing: 0.2,
+  },
+  legacyBanner: {
+    background: '#1f2937',
+    border: '1px solid #374151',
+    color: '#cbd5e1',
+    borderRadius: 6,
+    padding: '8px 12px',
+    fontSize: 12,
+    marginBottom: 16,
   },
   topbar: {
     display: 'flex',
@@ -137,6 +147,56 @@ const styles = {
     fontSize: 12,
     color: '#fcd34d',
   },
+  diffLineAdded: {
+    color: '#86efac',
+    background: '#14532d22',
+    fontFamily: 'ui-monospace, monospace',
+    fontSize: 12,
+    whiteSpace: 'pre-wrap' as const,
+    padding: '0 4px',
+  },
+  diffLineRemoved: {
+    color: '#fca5a5',
+    background: '#7f1d1d22',
+    fontFamily: 'ui-monospace, monospace',
+    fontSize: 12,
+    whiteSpace: 'pre-wrap' as const,
+    padding: '0 4px',
+  },
+  diffLineUnchanged: {
+    color: '#9ca3af',
+    fontFamily: 'ui-monospace, monospace',
+    fontSize: 12,
+    whiteSpace: 'pre-wrap' as const,
+    padding: '0 4px',
+  },
+  diffContainer: {
+    background: '#080808',
+    border: '1px solid #1e1e1e',
+    borderRadius: 4,
+    padding: 8,
+    marginTop: 8,
+    maxHeight: 360,
+    overflowY: 'auto' as const,
+  },
+  historyTurn: {
+    borderTop: '1px solid #1a1a1a',
+    padding: '8px 0',
+    fontSize: 12,
+  },
+  historyHeader: {
+    display: 'flex',
+    gap: 8,
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  historyContent: {
+    color: '#cbd5e1',
+    whiteSpace: 'pre-wrap' as const,
+    margin: 0,
+    fontFamily: 'inherit',
+    fontSize: 12,
+  },
 }
 
 interface Props {
@@ -169,6 +229,108 @@ function formatMemoryScore(score: number | undefined | null): string {
   return score.toFixed(3)
 }
 
+// Tiny, dependency-free line-by-line diff. Uses LCS via dynamic
+// programming: O(n*m) time / space, fine for the typical ≤200-line
+// inputs the inspector handles. Returns ordered diff lines.
+type DiffOp = 'added' | 'removed' | 'unchanged'
+interface DiffLine {
+  op: DiffOp
+  text: string
+}
+
+function lineDiff(oldText: string, newText: string): DiffLine[] {
+  const a = oldText.split('\n')
+  const b = newText.split('\n')
+  const n = a.length
+  const m = b.length
+  // dp[i][j] = LCS length of a[i:] and b[j:]
+  const dp: number[][] = Array.from({ length: n + 1 }, () =>
+    new Array(m + 1).fill(0),
+  )
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      if (a[i] === b[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1])
+      }
+    }
+  }
+  const out: DiffLine[] = []
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      out.push({ op: 'unchanged', text: a[i] })
+      i++
+      j++
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      out.push({ op: 'removed', text: a[i] })
+      i++
+    } else {
+      out.push({ op: 'added', text: b[j] })
+      j++
+    }
+  }
+  while (i < n) {
+    out.push({ op: 'removed', text: a[i] })
+    i++
+  }
+  while (j < m) {
+    out.push({ op: 'added', text: b[j] })
+    j++
+  }
+  return out
+}
+
+const DIFF_MAX_LINES = 50
+
+interface DiffViewerProps {
+  oldText: string
+  newText: string
+  /** Caption before the diff for context (e.g. "vs prior trace abc123"). */
+  caption?: string
+}
+
+function DiffViewer({ oldText, newText, caption }: DiffViewerProps) {
+  const diff = lineDiff(oldText, newText)
+  const visible = diff.slice(0, DIFF_MAX_LINES)
+  const omitted = diff.length - visible.length
+  const anyChanges = diff.some((d) => d.op !== 'unchanged')
+  return (
+    <div style={styles.diffContainer}>
+      {caption && (
+        <div style={{ fontSize: 11, color: '#888', marginBottom: 6 }}>
+          {caption}
+        </div>
+      )}
+      {!anyChanges && (
+        <div style={{ fontSize: 12, color: '#6b7280' }}>(no differences)</div>
+      )}
+      {visible.map((line, idx) => {
+        const prefix = line.op === 'added' ? '+ ' : line.op === 'removed' ? '- ' : '  '
+        const style =
+          line.op === 'added'
+            ? styles.diffLineAdded
+            : line.op === 'removed'
+              ? styles.diffLineRemoved
+              : styles.diffLineUnchanged
+        return (
+          <div key={idx} style={style}>
+            {prefix}
+            {line.text}
+          </div>
+        )
+      })}
+      {omitted > 0 && (
+        <div style={{ fontSize: 11, color: '#888', marginTop: 4 }}>
+          … {omitted} more line(s) (truncated)
+        </div>
+      )}
+    </div>
+  )
+}
+
 interface ExpandableMemoryRowProps {
   id: string
   score: number
@@ -176,6 +338,36 @@ interface ExpandableMemoryRowProps {
 
 function ExpandableMemoryRow({ id, score }: ExpandableMemoryRowProps) {
   const [open, setOpen] = useState(false)
+  const [memory, setMemory] = useState<MemoryDetail | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Fetch on first expand. We don't refetch on subsequent toggles —
+  // memory rows are append-only at the recall layer.
+  useEffect(() => {
+    if (!open || memory || loading) return
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    api
+      .getMemory(id)
+      .then((d) => {
+        if (cancelled) return
+        setMemory(d)
+        logInfo('inspector', 'memory_loaded', { memory_id: id })
+      })
+      .catch((e) => {
+        if (cancelled) return
+        const message = e instanceof Error ? e.message : String(e)
+        setError(message)
+        logError('inspector', 'memory_failed', { memory_id: id, message })
+      })
+      .finally(() => !cancelled && setLoading(false))
+    return () => {
+      cancelled = true
+    }
+  }, [open, id, memory, loading])
+
   return (
     <li
       style={{
@@ -207,13 +399,77 @@ function ExpandableMemoryRow({ id, score }: ExpandableMemoryRowProps) {
             fontSize: 12,
           }}
         >
-          Raw memory content fetch is not wired in this build — the
-          inspector exposes the IDs and scores stored on the trace's
-          provenance only. To read the underlying recall row, query
-          the memory subsystem directly with this ID.
+          {loading && <div>loading memory…</div>}
+          {error && (
+            <div style={{ color: '#fca5a5' }}>error: {error}</div>
+          )}
+          {memory && (
+            <>
+              <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>
+                type: <code>{memory.type}</code> · importance:{' '}
+                <code>{formatMemoryScore(memory.importance_score)}</code> ·
+                created: <code>{formatTimestamp(memory.created_at)}</code>
+              </div>
+              {/* React auto-escapes; <pre> renders raw text safely. */}
+              <pre style={styles.pre}>{memory.content}</pre>
+              {memory.summary && (
+                <>
+                  <div style={{ fontSize: 11, color: '#888', marginTop: 6 }}>
+                    summary:
+                  </div>
+                  <pre style={styles.pre}>{memory.summary}</pre>
+                </>
+              )}
+            </>
+          )}
         </div>
       )}
     </li>
+  )
+}
+
+interface HistoryViewProps {
+  history: Array<{ role?: string; content?: string; timestamp?: string }>
+}
+
+function HistoryView({ history }: HistoryViewProps) {
+  if (!Array.isArray(history) || history.length === 0) {
+    return <div style={styles.empty}>no history available</div>
+  }
+  // Per-turn timestamps: LastNTurnsSelector currently does not put
+  // per-message timestamps in provenance — provenance is count-based
+  // for now. We render whatever is present and explain when timestamps
+  // are absent. We never fabricate them.
+  const anyTimestamps = history.some((h) => h && typeof h.timestamp === 'string')
+  return (
+    <>
+      {!anyTimestamps && (
+        <div style={{ ...styles.empty, marginBottom: 6 }}>
+          (timestamps unavailable for this trace — provenance currently
+          records counts only)
+        </div>
+      )}
+      <div>
+        {history.map((turn, i) => {
+          const role = turn?.role ?? '?'
+          const ts = turn?.timestamp
+          const content = turn?.content ?? ''
+          return (
+            <div key={i} style={styles.historyTurn}>
+              <div style={styles.historyHeader}>
+                <span style={styles.pill('#60a5fa')}>{role}</span>
+                {ts && (
+                  <span style={{ fontSize: 11, color: '#9ca3af' }}>
+                    ({formatTimestamp(ts)})
+                  </span>
+                )}
+              </div>
+              <pre style={styles.historyContent}>{content}</pre>
+            </div>
+          )
+        })}
+      </div>
+    </>
   )
 }
 
@@ -293,6 +549,11 @@ export default function TraceContextInspector({ traceId, detail: detailProp, onB
   const memoryIds = prov.memory_ids || []
   const lifeContextContent =
     (prov.selectors?.life_context as { content?: string } | undefined)?.content ?? null
+  const lastNTurnsProvenance = (prov.selectors?.last_n_turns ?? {}) as Record<string, unknown>
+  const historyContent = (lastNTurnsProvenance.content ?? null) as
+    | Array<{ role?: string; content?: string; timestamp?: string }>
+    | null
+  const provenanceIsLegacy = Object.keys(prov).length === 0
 
   return (
     <div style={styles.root}>
@@ -301,6 +562,13 @@ export default function TraceContextInspector({ traceId, detail: detailProp, onB
         sections and memory IDs from the active database. Localhost bind
         is enforced server-side; never expose this UI on a public network.
       </div>
+
+      {provenanceIsLegacy && (
+        <div style={styles.legacyBanner}>
+          This trace pre-dates the assembly-provenance feature (#33).
+          Upgrade to a newer trace to inspect prompt construction.
+        </div>
+      )}
 
       <div style={styles.topbar}>
         <button style={styles.backButton} onClick={onBack}>
@@ -353,15 +621,16 @@ export default function TraceContextInspector({ traceId, detail: detailProp, onB
         </div>
         <div style={styles.sectionBody}>
           {reasons.last_n_turns && <div style={styles.reason}>{reasons.last_n_turns}</div>}
-          <div style={styles.empty}>
-            Provenance records the count and limit only; raw turn text isn't
-            persisted on the trace row to keep history mutations append-only.
-            The original turn was emitted at{' '}
-            <code>{formatTimestamp(detail.created_at)}</code>.
-          </div>
-          <pre style={{ ...styles.pre, marginTop: 10 }}>
-            {JSON.stringify(prov.selectors?.last_n_turns ?? {}, null, 2)}
-          </pre>
+          {historyContent && Array.isArray(historyContent) ? (
+            <HistoryView history={historyContent} />
+          ) : (
+            <div style={styles.empty}>
+              Provenance records the count and limit only; raw turn text isn't
+              persisted on the trace row to keep history mutations append-only.
+              The original turn was emitted at{' '}
+              <code>{formatTimestamp(detail.created_at)}</code>.
+            </div>
+          )}
         </div>
       </div>
 
@@ -460,43 +729,59 @@ export default function TraceContextInspector({ traceId, detail: detailProp, onB
             </div>
           )}
           {rerender && (
-            <>
-              {rerender.notes.length > 0 && (
-                <ul
-                  style={{
-                    ...styles.list,
-                    marginTop: 10,
-                    color: '#9ca3af',
-                    fontSize: 12,
-                  }}
-                >
-                  {rerender.notes.map((n, i) => (
-                    <li key={i}>{n}</li>
-                  ))}
-                </ul>
-              )}
-              <div style={{ marginTop: 10, fontSize: 11, color: '#888' }}>
-                rendered prompt:
-              </div>
-              <pre style={styles.pre}>{rerender.prompt}</pre>
-              <div style={{ marginTop: 10, fontSize: 11, color: '#888' }}>
-                provenance diff (original → re-rendered):
-              </div>
-              <pre style={styles.pre}>
-                {JSON.stringify(
-                  {
-                    original: rerender.original_provenance,
-                    rerendered: rerender.provenance,
-                  },
-                  null,
-                  2,
-                )}
-              </pre>
-            </>
+            <RerenderResult rerender={rerender} />
           )}
         </div>
       </div>
     </div>
+  )
+}
+
+interface RerenderResultProps {
+  rerender: RerenderPromptResponse
+}
+
+function RerenderResult({ rerender }: RerenderResultProps) {
+  // The original full prompt isn't stored on the trace row today (the
+  // trace stores input + output, not the rendered system prompt). When
+  // we have no original prompt to diff against, we fall back to a
+  // structural diff between the original provenance (persisted) and the
+  // re-rendered provenance (fresh) so the operator still gets a useful
+  // change view.
+  const newProvenancePretty = JSON.stringify(rerender.provenance, null, 2)
+  const oldProvenancePretty = JSON.stringify(rerender.original_provenance, null, 2)
+
+  return (
+    <>
+      {rerender.notes.length > 0 && (
+        <ul
+          style={{
+            ...styles.list,
+            marginTop: 10,
+            color: '#9ca3af',
+            fontSize: 12,
+          }}
+        >
+          {rerender.notes.map((n, i) => (
+            <li key={i}>{n}</li>
+          ))}
+        </ul>
+      )}
+      <div style={{ marginTop: 10, fontSize: 11, color: '#888' }}>
+        rendered prompt:
+      </div>
+      <pre style={styles.pre}>{rerender.prompt}</pre>
+      <div style={{ marginTop: 10, fontSize: 11, color: '#888' }}>
+        provenance diff (original → re-rendered) — the trace row stores
+        provenance only, not the original rendered prompt, so this is the
+        structural diff:
+      </div>
+      <DiffViewer
+        oldText={oldProvenancePretty}
+        newText={newProvenancePretty}
+        caption="original provenance → re-rendered provenance"
+      />
+    </>
   )
 }
 
@@ -515,33 +800,51 @@ function CapabilityBlockSection({
 }: CapabilityBlockSectionProps) {
   const [priorVersion, setPriorVersion] = useState<string | null>(null)
   const [priorTraceId, setPriorTraceId] = useState<string | null>(null)
+  const [priorContent, setPriorContent] = useState<string | null>(null)
   const [searched, setSearched] = useState(false)
+
+  const currentContent =
+    (capabilityProvenance?.content as string | undefined) ?? ''
 
   useEffect(() => {
     let cancelled = false
-    // Fetch a small window of recent traces and look for the most recent
-    // one with a different capability_block_version. This is best-effort:
-    // if the operator wants a precise prior trace, they can navigate via
-    // the trace list.
+    // Find the most recent trace with a different capability_block_version
+    // using ONLY the projected list view — no per-summary detail fetch
+    // (#34 review fix: was N+1). The list response now carries
+    // ``capability_block_version`` directly.
+    setSearched(false)
+    setPriorVersion(null)
+    setPriorTraceId(null)
+    setPriorContent(null)
     api
-      .listTraces({ limit: 25 })
+      .listTraces({ limit: 50 })
       .then(async (resp) => {
+        let foundSummary: { trace_id: string; capability_block_version?: string | null } | null = null
         for (const summary of resp.traces) {
           if (cancelled) return
           if (summary.trace_id === currentTraceId) continue
-          try {
-            const d = await api.getTrace(summary.trace_id)
-            if (cancelled) return
-            const ver = (d.assembled_context as ProvenanceShape | undefined)
-              ?.capability_block_version
-            if (ver && ver !== version) {
-              setPriorVersion(ver)
-              setPriorTraceId(d.trace_id)
-              break
-            }
-          } catch {
-            // fall through to next summary
+          const ver = summary.capability_block_version
+          if (ver && ver !== version) {
+            foundSummary = summary
+            break
           }
+        }
+        if (cancelled || !foundSummary) return
+        setPriorVersion(foundSummary.capability_block_version ?? null)
+        setPriorTraceId(foundSummary.trace_id)
+        // ONE detail fetch — only for the chosen prior trace, to pull
+        // its capability block content for the diff.
+        try {
+          const d = await api.getTrace(foundSummary.trace_id)
+          if (cancelled) return
+          const priorProv =
+            (d.assembled_context as ProvenanceShape | undefined)?.selectors
+              ?.capability_block
+          const content =
+            (priorProv as { content?: string } | undefined)?.content ?? null
+          setPriorContent(content)
+        } catch {
+          // ignore — we'll show version-only when the detail fetch fails
         }
       })
       .catch(() => {
@@ -561,10 +864,13 @@ function CapabilityBlockSection({
       </div>
       <div style={styles.sectionBody}>
         {reason && <div style={styles.reason}>{reason}</div>}
-        {capabilityProvenance && (
-          <pre style={styles.pre}>
-            {JSON.stringify(capabilityProvenance, null, 2)}
-          </pre>
+        {currentContent && (
+          <>
+            <div style={{ fontSize: 11, color: '#888', marginTop: 4 }}>
+              current rendered block:
+            </div>
+            <pre style={styles.pre}>{currentContent}</pre>
+          </>
         )}
         <div style={{ ...styles.capabilityDiff, marginTop: 10 }}>
           {!searched && 'searching for prior version…'}
@@ -579,11 +885,25 @@ function CapabilityBlockSection({
           )}
           {searched && !priorVersion && (
             <span style={{ color: '#888' }}>
-              no prior trace with a different version found in the last 25
+              no prior trace with a different version found in the last 50
               entries
             </span>
           )}
         </div>
+        {searched && priorVersion && currentContent && (
+          priorContent !== null ? (
+            <DiffViewer
+              oldText={priorContent}
+              newText={currentContent}
+              caption={`vs prior trace ${priorTraceId} (${priorVersion} → ${version})`}
+            />
+          ) : (
+            <div style={{ ...styles.empty, marginTop: 8 }}>
+              prior trace's capability block content not available (legacy
+              row) — version mismatch only
+            </div>
+          )
+        )}
       </div>
     </div>
   )

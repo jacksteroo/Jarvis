@@ -41,6 +41,10 @@ export interface TraceSummary {
   data_sensitivity: string
   tier: string
   scheduler_job_name: string | null
+  // #34 — projected from assembled_context so the inspector can find the
+  // previous trace with a different capability block version without
+  // issuing one detail fetch per summary.
+  capability_block_version?: string | null
 }
 
 export interface TraceDetail extends TraceSummary {
@@ -66,6 +70,18 @@ export interface RerenderPromptResponse {
   original_provenance: Record<string, unknown>
   matches_original: boolean
   notes: string[]
+}
+
+// Epic 01 (#34) — single-memory fetch for inspector expandable rows.
+export interface MemoryDetail {
+  id: number
+  type: string
+  content: string
+  summary: string | null
+  importance_score: number
+  created_at: string
+  accessed_at: string | null
+  has_embedding: boolean
 }
 
 export interface TraceListResponse {
@@ -268,4 +284,9 @@ export const api = {
     req<RerenderPromptResponse>(`/traces/${traceId}/rerender-prompt`, {
       method: 'POST',
     }),
+
+  // Epic 01 (#34) — fetch a single memory's content + metadata. Used by
+  // the trace inspector to expand a memory row from its provenance ID.
+  getMemory: (memoryId: string | number) =>
+    req<MemoryDetail>(`/memories/${memoryId}`),
 }

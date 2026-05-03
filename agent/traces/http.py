@@ -36,6 +36,7 @@ mirrors ADR-0005's append-only invariant at the API layer.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 from datetime import datetime
 from typing import Any, Optional
 
@@ -66,7 +67,18 @@ router = APIRouter(prefix="/traces", tags=["traces"])
 
 def _client_is_loopback(request: Request) -> bool:
     host = request.client.host if request.client else ""
-    return host in {"127.0.0.1", "::1", "localhost"} or host.startswith("127.")
+    if not host:
+        return False
+    # ``localhost`` is a hostname, not an IP — keep the string fallback
+    # so dev hosts that report it stay on the allow-list. The existing
+    # ``127.x`` branch is also kept because some clients return that
+    # without a fully-formed IP literal.
+    if host in {"localhost"} or host.startswith("127."):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 async def _enforce_localhost_bind(request: Request) -> None:
@@ -135,6 +147,11 @@ class TraceSummary(BaseModel):
     data_sensitivity: str
     tier: str
     scheduler_job_name: Optional[str] = None
+    # #34 — capability_block_version is projected onto the list view so the
+    # inspector can find the prior trace with a different version without
+    # issuing one detail fetch per summary. Cheap (12-char string) projected
+    # via JSONB ``->>`` operator at the repository layer.
+    capability_block_version: Optional[str] = None
 
 
 class TraceDetail(TraceSummary):
@@ -222,6 +239,7 @@ def get_assembler() -> Any:
 
 
 def _to_summary(t: Trace) -> TraceSummary:
+    cap_version = (t.assembled_context or {}).get("capability_block_version")
     return TraceSummary(
         trace_id=t.trace_id,
         created_at=t.created_at,
@@ -232,6 +250,7 @@ def _to_summary(t: Trace) -> TraceSummary:
         data_sensitivity=t.data_sensitivity.value,
         tier=t.tier.value,
         scheduler_job_name=t.scheduler_job_name,
+        capability_block_version=str(cap_version) if cap_version else None,
     )
 
 
@@ -240,31 +259,21 @@ def _decision_reasons_from_stored(
 ) -> dict[str, str]:
     """Compute ``selector_name -> human reason`` from a stored provenance dict.
 
-    ``agent.context.annotate`` operates on an :class:`AssembledContext`,
-    but persisted traces only carry the JSON-serialized provenance map
-    under ``assembled_context["selectors"]`` (per #33). We rehydrate
-    just enough to feed the same explainers — this stays in sync with
-    ``decisions.py`` because we delegate to its private explainer table.
+    Delegates to :func:`agent.context.annotate_from_provenance` — the
+    public API for rendering reasons against a JSON-serialized provenance
+    shape. We pass the persisted ``selectors`` sub-dict (per #33) and let
+    decisions.py own the explainer table.
     """
     selectors = (assembled_context or {}).get("selectors") or {}
-    if not isinstance(selectors, dict) or not selectors:
-        return {}
     try:
         # Local import keeps the http module loadable without the context
         # subsystem when tests stub things out.
-        from agent.context.decisions import _EXPLAINERS, _explain_default
+        from agent.context.decisions import annotate_from_provenance
     except Exception:
         return {}
-    out: dict[str, str] = {}
-    for name, prov in selectors.items():
-        if not isinstance(prov, dict):
-            continue
-        explainer = _EXPLAINERS.get(name, _explain_default)
-        try:
-            out[name] = explainer(prov)
-        except Exception:
-            out[name] = f"{name}: provenance present"
-    return out
+    if not isinstance(selectors, dict):
+        return {}
+    return annotate_from_provenance(selectors)
 
 
 def _to_detail(t: Trace) -> TraceDetail:
@@ -447,7 +456,11 @@ _PROVENANCE_VOLATILE_TOP_LEVEL_KEYS: frozenset[str] = frozenset({
 
 # Per-selector volatile keys. Same rationale.
 _PROVENANCE_VOLATILE_SELECTOR_KEYS: dict[str, frozenset[str]] = {
-    "last_n_turns": frozenset({"last_n_turns", "n_messages"}),
+    # ``content`` and ``role_counts`` track the live history shape and
+    # drift across re-renders even when the assembler hasn't changed.
+    "last_n_turns": frozenset(
+        {"last_n_turns", "n_messages", "content", "role_counts"}
+    ),
 }
 
 
@@ -497,6 +510,16 @@ async def rerender_prompt(
     have produced the same prompt for this past turn?". For unchanged
     code this should be a structural match; for code changes the diff
     is the answer.
+
+    **Why POST (not GET) for a read-only re-render?** The rendered prompt
+    is RAW_PERSONAL — it embeds the full life-context document and any
+    secrets the system prompt carries. A GET would put identifying
+    parameters in URL query strings (none today, but the pattern is
+    fragile), and any future variant that accepts overrides would push
+    that material into URL query strings, server access logs, browser
+    history, and Referer headers. POST keeps the inputs in the request
+    body and the rendered prompt in the response body only. The audit
+    log records the request, never the body.
 
     Limitations (returned in ``notes`` so the UI can render them):
 
