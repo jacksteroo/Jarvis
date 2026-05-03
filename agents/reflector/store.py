@@ -273,10 +273,10 @@ def _row_to_reflection(row: ReflectionRow) -> Reflection:
 class ReflectionRepository:
     """Append-only repository for reflections.
 
-    Public surface: `append`, `get_by_id`, `latest`, `query`. No
-    `update_*`, no `delete_*`. The lint test
-    `agent/tests/test_reflections_repository.py` asserts via
-    `hasattr` that disallowed methods do not exist.
+    Public surface: `append`, `get_by_id`, `latest`, `query`,
+    `query_by_window`. No `update_*`, no `delete_*`. The lint test
+    `agent/tests/test_reflector_store.py` asserts via `inspect` that
+    disallowed methods do not exist.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -335,7 +335,13 @@ class ReflectionRepository:
         until: Optional[datetime] = None,
         limit: int = 100,
     ) -> Sequence[Reflection]:
-        """Return reflections matching the filters, newest first."""
+        """Return reflections matching the filters, newest first.
+
+        `since` / `until` filter on `created_at` — i.e. when the row
+        was *written*, not when its window covers. Use
+        `query_by_window` for rollups (which need "reflections whose
+        window starts inside [a, b)").
+        """
         if tier is not None and tier not in _VALID_TIERS:
             raise ValueError(f"unknown tier {tier!r}")
         limit = max(1, min(limit, MAX_QUERY_LIMIT))
@@ -352,6 +358,42 @@ class ReflectionRepository:
         if until is not None:
             stmt = stmt.where(ReflectionRow.created_at <= until)
 
+        result = await self._session.execute(stmt)
+        rows = result.scalars().all()
+        return [_row_to_reflection(r) for r in rows]
+
+    async def query_by_window(
+        self,
+        *,
+        tier: str,
+        window_start_gte: datetime,
+        window_start_lt: datetime,
+        limit: int = 100,
+    ) -> Sequence[Reflection]:
+        """Return reflections whose `window_start` is in `[gte, lt)`.
+
+        Required by #40's rollups: the weekly rollup needs the seven
+        dailies that COVER Mon..Sun, even if one of them was written
+        late (backfill, retry after a crash, etc.). Filtering on
+        `created_at` would silently drop those rows.
+
+        `tier` is required: rollups always look at exactly one
+        previous-tier set (daily-for-weekly, weekly-for-monthly). Sort
+        is ascending on `window_start` so callers consume children in
+        chronological order without re-sorting.
+        """
+        if tier not in _VALID_TIERS:
+            raise ValueError(f"unknown tier {tier!r}")
+        limit = max(1, min(limit, MAX_QUERY_LIMIT))
+
+        stmt = (
+            select(ReflectionRow)
+            .where(ReflectionRow.tier == tier)
+            .where(ReflectionRow.window_start >= window_start_gte)
+            .where(ReflectionRow.window_start < window_start_lt)
+            .order_by(ReflectionRow.window_start.asc())
+            .limit(limit)
+        )
         result = await self._session.execute(stmt)
         rows = result.scalars().all()
         return [_row_to_reflection(r) for r in rows]

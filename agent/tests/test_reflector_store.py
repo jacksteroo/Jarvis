@@ -45,7 +45,13 @@ class TestNoMutationSurface:
             if not name.startswith("_")
         )
         # If this list grows, the no-mutation discipline must be re-checked.
-        assert public == ["append", "get_by_id", "latest", "query"]
+        assert public == [
+            "append",
+            "get_by_id",
+            "latest",
+            "query",
+            "query_by_window",
+        ]
 
 
 class TestReflectionDataclassGuards:

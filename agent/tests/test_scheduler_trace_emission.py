@@ -158,3 +158,45 @@ class TestReflectorTrigger:
         # ADR-0005 / #23 spec name. If anyone renames the channel they
         # must update both the scheduler and the reflector LISTEN side.
         assert REFLECTOR_TRIGGER_CHANNEL == "reflector_trigger"
+
+
+class TestReflectorRollupTriggers:
+    """#40: weekly + monthly rollup NOTIFYs share the daily channel's
+    contract (signal-only date payload, fail-soft on DB error)."""
+
+    @pytest.mark.asyncio
+    async def test_weekly_fires_on_documented_channel(self) -> None:
+        from agent.scheduler import REFLECTOR_WEEKLY_CHANNEL
+
+        pepper = _make_pepper(with_db=True)
+        sch = PepperScheduler(pepper, _make_config())
+        ok = await sch.fire_reflector_weekly_trigger()
+        assert ok is True
+        assert len(pepper._executed_sql) == 1
+        sql = pepper._executed_sql[0]
+        assert sql.startswith(f"NOTIFY {REFLECTOR_WEEKLY_CHANNEL}")
+        assert "trace" not in sql.lower()
+        assert "SELECT" not in sql
+
+    @pytest.mark.asyncio
+    async def test_monthly_fires_on_documented_channel(self) -> None:
+        from agent.scheduler import REFLECTOR_MONTHLY_CHANNEL
+
+        pepper = _make_pepper(with_db=True)
+        sch = PepperScheduler(pepper, _make_config())
+        ok = await sch.fire_reflector_monthly_trigger()
+        assert ok is True
+        sql = pepper._executed_sql[0]
+        assert sql.startswith(f"NOTIFY {REFLECTOR_MONTHLY_CHANNEL}")
+
+    def test_rollup_channel_names_are_pinned(self) -> None:
+        from agent.scheduler import (
+            REFLECTOR_MONTHLY_CHANNEL,
+            REFLECTOR_WEEKLY_CHANNEL,
+        )
+
+        # If anyone renames these, the reflector LISTEN side
+        # (`agents/reflector/main.py: WEEKLY_CHANNEL` /
+        # `MONTHLY_CHANNEL`) must move in lockstep.
+        assert REFLECTOR_WEEKLY_CHANNEL == "reflector_weekly_trigger"
+        assert REFLECTOR_MONTHLY_CHANNEL == "reflector_monthly_trigger"
