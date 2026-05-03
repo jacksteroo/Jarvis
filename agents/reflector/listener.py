@@ -1,9 +1,13 @@
-"""Postgres `LISTEN/NOTIFY` client for the reflector trigger.
+"""Postgres `LISTEN/NOTIFY` client for the reflector triggers.
 
-The reflector subscribes to a single channel (default
-`reflector_trigger`). Pepper Core's APScheduler fires one NOTIFY per
-day at end-of-day with a date-string payload (see
-`agent/scheduler.py:fire_reflector_trigger`).
+The reflector subscribes to one or more channels — daily at minimum
+(`reflector_trigger`), plus weekly + monthly rollup channels added in
+#40 (`reflector_weekly_trigger`, `reflector_monthly_trigger`). Pepper
+Core's APScheduler fires one NOTIFY per cadence:
+
+- daily: 23:55 local (Epic 01 #23)
+- weekly: Sunday 23:55 local (#40)
+- monthly: day-1 00:05 local (#40)
 
 The connection is opened with raw asyncpg, NOT through SQLAlchemy:
 LISTEN holds an idle connection forever, which is incompatible with
@@ -18,12 +22,12 @@ Failure modes:
   this happens more than once per minute, revisit supervision.
 - Notify payload is malformed → we log and ignore; the reflector
   uses its own clock for the window, not the payload, so a bad
-  payload only loses the trigger for that day.
+  payload only loses the trigger for that cadence.
 """
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 
 import asyncpg
 import structlog
@@ -45,19 +49,24 @@ def _to_libpq_url(sqlalchemy_url: str) -> str:
 async def listen_for_triggers(
     *,
     sqlalchemy_url: str,
-    channel: str,
+    channels: Iterable[str],
     stop: asyncio.Event,
-) -> AsyncIterator[str]:
-    """Yield each NOTIFY payload received on `channel` until `stop` is set.
+) -> AsyncIterator[tuple[str, str]]:
+    """Yield each NOTIFY as (channel, payload) until `stop` is set.
 
-    Opens a dedicated asyncpg connection, registers a listener, and
-    streams payloads. The function exits cleanly when `stop` is set
-    (the runner sets it on SIGTERM/SIGINT) or when the connection
-    drops. Re-establishing on drop is the operator's responsibility
-    (docker `restart: unless-stopped`).
+    Opens a single dedicated asyncpg connection and registers a
+    listener for every channel in `channels`. Yields a tuple so the
+    caller can dispatch by cadence (daily / weekly / monthly).
+
+    Exits cleanly when `stop` is set (the runner sets it on
+    SIGTERM/SIGINT) or when the connection drops; re-establishing is
+    the operator's responsibility (docker `restart: unless-stopped`).
     """
     libpq_url = _to_libpq_url(sqlalchemy_url)
-    queue: asyncio.Queue[str] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+    channel_list = list(channels)
+    if not channel_list:
+        raise ValueError("listen_for_triggers requires at least one channel")
 
     def _on_notify(
         connection: asyncpg.Connection,
@@ -65,16 +74,17 @@ async def listen_for_triggers(
         ch: str,
         payload: str,
     ) -> None:
-        # Callbacks run in the asyncpg loop; queue.put_nowait is
-        # async-safe because asyncpg notify dispatch is sync.
+        # asyncpg invokes this callback synchronously from the
+        # connection's event loop; queue.put_nowait is safe.
         try:
-            queue.put_nowait(payload)
+            queue.put_nowait((ch, payload))
         except asyncio.QueueFull:  # pragma: no cover — unbounded queue
             logger.warning("reflector_listener_queue_full", channel=ch)
 
     conn = await asyncpg.connect(libpq_url)
-    await conn.add_listener(channel, _on_notify)
-    logger.info("reflector_listener_started", channel=channel)
+    for ch in channel_list:
+        await conn.add_listener(ch, _on_notify)
+    logger.info("reflector_listener_started", channels=channel_list)
 
     try:
         while not stop.is_set():
@@ -88,12 +98,13 @@ async def listen_for_triggers(
                 t.cancel()
             if stop_task in done:
                 break
-            payload = payload_task.result()
-            yield payload
+            ch, payload = payload_task.result()
+            yield ch, payload
     finally:
-        try:
-            await conn.remove_listener(channel, _on_notify)
-        except Exception:  # pragma: no cover — best-effort
-            pass
+        for ch in channel_list:
+            try:
+                await conn.remove_listener(ch, _on_notify)
+            except Exception:  # pragma: no cover — best-effort
+                pass
         await conn.close()
-        logger.info("reflector_listener_stopped", channel=channel)
+        logger.info("reflector_listener_stopped", channels=channel_list)

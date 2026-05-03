@@ -465,6 +465,28 @@ class TestValidators:
             rmain._validate_notify_channel(channel)
 
 
+@pytest.mark.asyncio
+class TestRunBootValidation:
+    """Boot-time refusal to subscribe a daily channel onto a rollup
+    channel — closes the env-override foot-gun the #40 review found."""
+
+    @pytest.mark.parametrize(
+        "colliding",
+        [rmain.WEEKLY_CHANNEL, rmain.MONTHLY_CHANNEL],
+    )
+    async def test_daily_channel_collision_with_rollup_is_refused(
+        self, colliding: str
+    ) -> None:
+        cfg = rmain.AgentRuntimeConfig(
+            archetype="reflector",
+            postgres_url="postgresql+asyncpg://test/test",
+            log_level="DEBUG",
+            notify_channel=colliding,
+        )
+        with pytest.raises(rmain.ReflectorConfigError, match="collides"):
+            await rmain.run(cfg)
+
+
 class TestWindowForPayload:
     def test_well_formed_utc_payload(self) -> None:
         ws, we = rmain._window_for_payload(

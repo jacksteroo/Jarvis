@@ -22,11 +22,15 @@ from agent.commitment_followup import CommitmentFollowup
 from agent.models import AuditLog
 from agent.traces import TriggerSource
 
-# Postgres NOTIFY channel used to signal end-of-day to the reflector
-# process (#39). The payload is intentionally signal-only — no trace
-# contents — so the LISTEN client can never interpret the channel as
-# a content sink.
+# Postgres NOTIFY channels used to signal cadence-bounded work to the
+# reflector process. The daily channel (#39) fires at 23:55 local; the
+# weekly + monthly rollup channels (#40) fire on Sunday 23:55 and on
+# day-1 00:05 respectively. Payloads are intentionally signal-only —
+# a date string in the format `YYYY-MM-DD` (local TZ) — so the LISTEN
+# client can never interpret the channel as a content sink.
 REFLECTOR_TRIGGER_CHANNEL = "reflector_trigger"
+REFLECTOR_WEEKLY_CHANNEL = "reflector_weekly_trigger"
+REFLECTOR_MONTHLY_CHANNEL = "reflector_monthly_trigger"
 
 logger = structlog.get_logger()
 
@@ -97,6 +101,33 @@ class PepperScheduler:
             self.fire_reflector_trigger,
             CronTrigger(hour=23, minute=55),
             id="reflector_trigger",
+            replace_existing=True,
+        )
+        # Epic 04 (#40): weekly rollup trigger. Fires MONDAY 00:15
+        # local — *not* Sunday 23:55. The reflector's daily pass
+        # (180 s LLM cap, 300 s wall-clock) needs to land Sunday's
+        # daily before the weekly query runs. Co-firing them in the
+        # same minute would race: the weekly might roll up only six
+        # dailies (Mon-Sat) if it dequeued first. 20 minutes after
+        # the Sunday daily is comfortable headroom.
+        # Payload is the SUNDAY date (today_local minus one day) so
+        # the rollup window calculation matches "the week that just
+        # ended."
+        self._scheduler.add_job(
+            self.fire_reflector_weekly_trigger,
+            CronTrigger(day_of_week=0, hour=0, minute=15),
+            id="reflector_weekly_trigger",
+            replace_existing=True,
+        )
+        # Epic 04 (#40): monthly rollup trigger. Fires day 1 of each
+        # month at 00:15 local — 20 minutes after the day-1 daily
+        # would have started running (and any in-flight Sunday weekly
+        # has finished). Covers the previous month. Payload is
+        # signal-only (the day-1 date string).
+        self._scheduler.add_job(
+            self.fire_reflector_monthly_trigger,
+            CronTrigger(day=1, hour=0, minute=15),
+            id="reflector_monthly_trigger",
             replace_existing=True,
         )
         # Epic 01 (#21): nightly trace compression. Promotes
@@ -320,45 +351,85 @@ class PepperScheduler:
             )
             return {"ok": False, "error": type(exc).__name__}
 
-    async def fire_reflector_trigger(self) -> bool:
-        """Fire the end-of-day Postgres NOTIFY for the reflector (#39).
+    async def _fire_reflector_notify(
+        self, channel: str, audit_kind: str, *, payload_date_offset_days: int = 0
+    ) -> bool:
+        """Common path: NOTIFY <channel>, '<YYYY-MM-DD>' in local TZ.
 
-        Payload format: `<YYYY-MM-DD>` in the local timezone — a fixed,
-        signal-only string. The reflector LISTENs on this channel and
-        kicks off its daily window query. Trace contents are NEVER
-        included in the payload. Returns True on success, False on
-        error (job is best-effort and never raises).
+        Payload is signal-only. The channel name is interpolated into
+        the literal NOTIFY SQL; all `channel` callers below are
+        compile-time constants, so there is no user-supplied input
+        here. Date payload is generated server-side and escaped for
+        the single-quoted literal as defence in depth.
+
+        `payload_date_offset_days` lets the weekly trigger send the
+        Sunday-of-the-just-ended-week even though the cron itself
+        fires on Monday 00:15 (#40 race-fix). Defaults to 0
+        (today's date in local TZ).
         """
         if self.pepper.db_factory is None:
-            logger.info("reflector_trigger_skipped", reason="no_db_factory")
+            logger.info("reflector_trigger_skipped", reason="no_db_factory", channel=channel)
             return False
         tz = ZoneInfo(self.config.TIMEZONE)
-        payload = datetime.now(tz).strftime("%Y-%m-%d")
+        when = datetime.now(tz) + timedelta(days=payload_date_offset_days)
+        payload = when.strftime("%Y-%m-%d")
         try:
             async with self.pepper.db_factory() as session:
-                # NOTIFY needs literal SQL — no bind parameters allowed
-                # in NOTIFY's payload position. The payload is a fixed-
-                # format date string we generated ourselves; no user
-                # input flows into this SQL.
                 escaped = payload.replace("'", "''")
                 await session.execute(
-                    text(f"NOTIFY {REFLECTOR_TRIGGER_CHANNEL}, '{escaped}'"),
+                    text(f"NOTIFY {channel}, '{escaped}'"),
                 )
                 await session.commit()
             logger.info(
                 "reflector_trigger_fired",
-                channel=REFLECTOR_TRIGGER_CHANNEL,
+                channel=channel,
                 payload=payload,
             )
-            await self._audit("reflector_trigger", payload)
+            await self._audit(audit_kind, payload)
             return True
         except Exception as exc:
             logger.warning(
                 "reflector_trigger_failed",
+                channel=channel,
                 error_type=type(exc).__name__,
                 error=str(exc)[:200],
             )
             return False
+
+    async def fire_reflector_trigger(self) -> bool:
+        """Fire the end-of-day Postgres NOTIFY for the reflector (#39).
+
+        Cron: every day at 23:55 local. Payload = today's date.
+        """
+        return await self._fire_reflector_notify(
+            REFLECTOR_TRIGGER_CHANNEL, "reflector_trigger"
+        )
+
+    async def fire_reflector_weekly_trigger(self) -> bool:
+        """Fire the Monday-00:15 weekly rollup NOTIFY (#40).
+
+        Cron fires on Monday 00:15 local — *not* Sunday 23:55 — so
+        Sunday's daily reflection has time to land first (race-fix
+        from #40 review). The payload is therefore yesterday's date
+        (Sunday) so `weekly_window_for_payload` reads the Sunday at
+        the end of the week the rollup covers.
+        """
+        return await self._fire_reflector_notify(
+            REFLECTOR_WEEKLY_CHANNEL,
+            "reflector_weekly_trigger",
+            payload_date_offset_days=-1,
+        )
+
+    async def fire_reflector_monthly_trigger(self) -> bool:
+        """Fire the day-1 00:15 monthly rollup NOTIFY (#40).
+
+        Cron fires on the 1st of the month at 00:15 local. Payload =
+        today's date (the 1st), which the rollup interprets as
+        "cover the previous month."
+        """
+        return await self._fire_reflector_notify(
+            REFLECTOR_MONTHLY_CHANNEL, "reflector_monthly_trigger"
+        )
 
     def get_status(self) -> dict:
         return {

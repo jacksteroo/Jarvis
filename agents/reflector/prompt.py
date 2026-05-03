@@ -20,6 +20,8 @@ from typing import Sequence
 from agent.traces.schema import Trace
 
 PROMPT_VERSION: str = "reflector-daily-v0"
+PROMPT_VERSION_WEEKLY: str = "reflector-weekly-v0"
+PROMPT_VERSION_MONTHLY: str = "reflector-monthly-v0"
 
 SYSTEM_PROMPT: str = (
     "You are Pepper, a sovereign local-first AI life assistant. You are "
@@ -40,6 +42,44 @@ SYSTEM_PROMPT: str = (
     "lightly (continuity), but do not summarise it. Today is the "
     "subject.\n"
     "5. No bullet lists, no headers, no markdown.\n"
+)
+
+SYSTEM_PROMPT_WEEKLY: str = (
+    "You are Pepper. You are writing a private end-of-week reflection "
+    "FOR YOURSELF, looking back across the seven daily reflections "
+    "below. Same voice as the dailies — first-person, no audience.\n\n"
+    "Hard rules for the weekly:\n"
+    "1. First-person voice. Never 'Jack should…', 'recommend…', "
+    "'action items', 'TLDR', 'follow-ups', 'next steps'.\n"
+    "2. IDENTIFY THEMES. Do NOT concatenate or paraphrase the dailies "
+    "in order. Look for what actually recurred across the week — a "
+    "feeling that came back, a pattern in the work, a friction that "
+    "showed up more than once. If nothing recurred, say so honestly.\n"
+    "3. Length: one short paragraph. Three to six sentences. Quiet "
+    "weeks get one sentence and a stop.\n"
+    "4. No bullet lists, no headers, no markdown.\n"
+    "5. If a previous weekly reflection is provided, you may "
+    "reference it lightly (continuity across weeks), but the present "
+    "week is the subject.\n"
+)
+
+SYSTEM_PROMPT_MONTHLY: str = (
+    "You are Pepper. You are writing a private end-of-month reflection "
+    "FOR YOURSELF, looking back across the four (give or take) weekly "
+    "reflections below. Same voice as the dailies and weeklies — "
+    "first-person, no audience.\n\n"
+    "Hard rules for the monthly:\n"
+    "1. First-person voice. Never 'Jack should…', 'recommend…', "
+    "'action items', 'TLDR', 'follow-ups', 'next steps'.\n"
+    "2. IDENTIFY THEMES that held across the month, not week-by-week "
+    "summaries. What changed shape over the month? What faded? What "
+    "showed up new? What stayed exactly the same?\n"
+    "3. Length: one paragraph. Four to seven sentences. The horizon "
+    "is longer than the weekly so a little more length is fine, but "
+    "do not pad.\n"
+    "4. No bullet lists, no headers, no markdown.\n"
+    "5. If a previous monthly reflection is provided, you may "
+    "reference it lightly (continuity across months).\n"
 )
 
 
@@ -126,6 +166,67 @@ def render_user_prompt(
     parts.append(
         "Write your end-of-day reflection now, following the rules in your "
         "system prompt. Plain text, first person, three to six sentences."
+    )
+    return "\n".join(parts)
+
+
+# ── Rollup prompt rendering ──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ReflectionDigest:
+    """One child reflection projected to the fields a rollup prompt uses.
+
+    Mirrors `TraceDigest` but for the previous-tier reflections that
+    feed weekly/monthly rollups.
+    """
+
+    date: str  # local-day window_start, "YYYY-MM-DD"
+    text: str
+
+
+def render_rollup_prompt(
+    *,
+    tier_label: str,
+    window_start: datetime,
+    window_end: datetime,
+    children: Sequence[ReflectionDigest],
+    previous_rollup_text: str | None,
+) -> str:
+    """Render the user-side prompt for a weekly or monthly rollup.
+
+    `tier_label` is "week" or "month" — purely a vocabulary hint for
+    the LLM. The system prompt enforces the voice rules; this helper
+    just lays out the inputs.
+    """
+    parts: list[str] = []
+    parts.append(
+        f"{tier_label.capitalize()} window: "
+        f"{window_start.astimezone(timezone.utc).isoformat()} → "
+        f"{window_end.astimezone(timezone.utc).isoformat()}"
+    )
+    parts.append("")
+    if previous_rollup_text:
+        parts.append(f"Previous {tier_label}'s reflection (yours):")
+        parts.append(previous_rollup_text.strip())
+    else:
+        parts.append(f"Previous {tier_label}'s reflection: (none — first one)")
+    parts.append("")
+    if not children:
+        parts.append(
+            f"There are no child reflections in this {tier_label}. "
+            "Acknowledge that in one sentence and stop."
+        )
+    else:
+        parts.append(f"Child reflections ({len(children)}):")
+        for i, c in enumerate(children, start=1):
+            parts.append(f"\n[{i}] {c.date}")
+            parts.append(f"    {c.text.strip()}")
+    parts.append("")
+    parts.append(
+        f"Write your end-of-{tier_label} reflection now. Identify "
+        "themes that recurred — do not concatenate. Plain text, "
+        "first person, follow the length rules in the system prompt."
     )
     return "\n".join(parts)
 
