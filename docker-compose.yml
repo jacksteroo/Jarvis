@@ -122,40 +122,46 @@ services:
   # ---------------------------------------------------------------------------
   # Cognitive archetypes (ADR-0004 + ADR-0006). Each archetype runs as its
   # own service, launched via `python -m agents.runner --archetype <name>`.
-  # The first inhabitant — `agents-reflector` — is added in #39 by
-  # uncommenting the block below and replacing `<archetype>`. Subsequent
-  # archetypes (`monitor`, `researcher`) follow the same shape.
-  #
-  # Skeleton kept here so the diff in #39 is `-#` not "invent the service".
+  # First inhabitant: `agents-reflector` (#39). Subsequent archetypes
+  # (`monitor`, `researcher`) follow the same shape.
   # ---------------------------------------------------------------------------
-  # agents-<archetype>:
-  #   build: .
-  #   image: pepper:latest
-  #   container_name: pepper-agents-<archetype>
-  #   restart: unless-stopped
-  #   command: ["python", "-m", "agents.runner", "--archetype", "<archetype>"]
-  #   # NOTE for #39: do NOT inherit Pepper Core's full `.env` here. An
-  #   # archetype only needs POSTGRES_URL + its own archetype-specific
-  #   # vars; pulling the whole env unnecessarily widens blast radius
-  #   # (Google OAuth tokens, WhatsApp bridge token, API keys). When the
-  #   # archetype role split lands (per ADR-0005 §"Postgres roles &
-  #   # grants"), point POSTGRES_URL at the per-archetype role
-  #   # (`pepper_traces_reader` for read-only archetypes) rather than
-  #   # the superuser-equivalent `pepper:pepper`.
-  #   environment:
-  #     POSTGRES_URL: postgresql+asyncpg://pepper:pepper@postgres:5432/pepper
-  #     PYTHONPATH: /app
-  #   volumes:
-  #     # Source mounts are :ro — agents write only to Postgres, never to
-  #     # their own source tree. The shared `agent.traces.*` reader is the
-  #     # documented surface; everything else is forbidden by the lint at
-  #     # `agent/tests/test_agents_isolation.py`.
-  #     - ./agents:/app/agents:ro
-  #     - ./agent:/app/agent:ro
-  #     - ./logs:/app/logs
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
+  agents-reflector:
+    build: .
+    image: pepper:latest
+    container_name: pepper-agents-reflector
+    restart: unless-stopped
+    command: ["python", "-m", "agents.runner", "--archetype", "reflector"]
+    # Narrow env: the reflector only needs Postgres + Ollama + its
+    # local-model name. We do NOT inherit the full `.env`; that would
+    # hand the reflector container Google OAuth tokens, the WhatsApp
+    # bridge token, and Anthropic / Brave / Maps API keys it has no
+    # business holding. Per the operator note in #38: when the
+    # per-archetype role split lands (ADR-0005 §"Postgres roles &
+    # grants"), point POSTGRES_URL at the `pepper_traces_reader`
+    # role for the reflector.
+    environment:
+      POSTGRES_URL: postgresql+asyncpg://pepper:pepper@postgres:5432/pepper
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      DEFAULT_LOCAL_MODEL: ${DEFAULT_LOCAL_MODEL:-hermes-4.3-36b-tools:latest}
+      # Aligns the reflector's daily window to the same TZ Pepper Core
+      # fires the trigger in (`agent/scheduler.py:fire_reflector_trigger`).
+      TIMEZONE: ${TIMEZONE:-America/Los_Angeles}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PYTHONPATH: /app
+      RUNNING_IN_DOCKER: "1"
+    volumes:
+      # Source mounts are :ro — the reflector writes only to Postgres,
+      # never to its own source tree. The shared `agent.traces.*`
+      # reader is the documented surface; everything else is
+      # forbidden by `agent/tests/test_agents_isolation.py`.
+      - ./agents:/app/agents:ro
+      - ./agent:/app/agent:ro
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   # cloudflared:
   #   image: cloudflare/cloudflared:latest
