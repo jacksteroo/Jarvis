@@ -53,6 +53,19 @@ export interface TraceDetail extends TraceSummary {
   user_reaction: Record<string, unknown> | null
   embedding_model_version: string | null
   has_embedding: boolean
+  // #34 — selector → human reason map computed off stored provenance.
+  decision_reasons: Record<string, string>
+}
+
+// Epic 01 (#34) — context inspector re-render endpoint.
+export interface RerenderPromptResponse {
+  trace_id: string
+  prompt: string
+  prompt_hash: string
+  provenance: Record<string, unknown>
+  original_provenance: Record<string, unknown>
+  matches_original: boolean
+  notes: string[]
 }
 
 export interface TraceListResponse {
@@ -248,4 +261,11 @@ export const api = {
   },
 
   getTrace: (traceId: string) => req<TraceDetail>(`/traces/${traceId}`),
+
+  // Epic 01 (#34) — re-render the prompt for a trace using the live
+  // assembler. Result is in-browser only — never logged server-side.
+  rerenderPrompt: (traceId: string) =>
+    req<RerenderPromptResponse>(`/traces/${traceId}/rerender-prompt`, {
+      method: 'POST',
+    }),
 }
